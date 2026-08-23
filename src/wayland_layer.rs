@@ -145,6 +145,8 @@ fn run_inner(
         display_index: 0,
         rendered_generation: u64::MAX,
         bound_output: None,
+        scale_factor: 1,
+        unsupported_transform: false,
         initialized: false,
         state,
     };
@@ -179,6 +181,8 @@ struct LayerState {
     display_index: usize,
     rendered_generation: u64,
     bound_output: Option<wl_output::WlOutput>,
+    scale_factor: u32,
+    unsupported_transform: bool,
     initialized: bool,
     state: Arc<Mutex<SharedState>>,
 }
@@ -261,6 +265,9 @@ impl LayerState {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
+        if self.unsupported_transform {
+            return;
+        }
         let Some(layer) = self.layer.clone() else {
             return;
         };
@@ -268,8 +275,13 @@ impl LayerState {
             set_error(&self.state, "Wayland shared-memory pool is unavailable");
             return;
         };
-        let width = self.width.max(1);
-        let height = self.height.max(1);
+        let (width, height) = match scaled_dimensions(self.width, self.height, self.scale_factor) {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                set_error(&self.state, error);
+                return;
+            }
+        };
         let stride = width as i32 * 4;
         let shared = self.state.lock().unwrap().clone();
         let (buffer, generation) = {
@@ -319,17 +331,39 @@ impl CompositorHandler for LayerState {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        surface: &wl_surface::WlSurface,
+        factor: i32,
     ) {
+        if factor < 1 {
+            set_error(
+                &self.state,
+                format!("unsupported Wayland fractional scale: {factor}"),
+            );
+            return;
+        }
+        surface.set_buffer_scale(factor);
+        let factor = factor as u32;
+        if self.scale_factor != factor {
+            self.scale_factor = factor;
+            self.pool = None;
+            self.rendered_generation = u64::MAX;
+        }
     }
     fn transform_changed(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
+        transform: wl_output::Transform,
     ) {
+        self.unsupported_transform = transform != wl_output::Transform::Normal;
+        if self.unsupported_transform {
+            set_error(&self.state, "unsupported Wayland output transform");
+        } else {
+            self.pool = None;
+            self.rendered_generation = u64::MAX;
+            clear_error(&self.state);
+        }
     }
 
     fn frame(
@@ -426,8 +460,14 @@ impl LayerShellHandler for LayerState {
         if self.layer.as_ref() != Some(layer) {
             return;
         }
-        self.width = NonZeroU32::new(configure.new_size.0).map_or(1, NonZeroU32::get);
-        self.height = NonZeroU32::new(configure.new_size.1).map_or(1, NonZeroU32::get);
+        let width = NonZeroU32::new(configure.new_size.0).map_or(1, NonZeroU32::get);
+        let height = NonZeroU32::new(configure.new_size.1).map_or(1, NonZeroU32::get);
+        if self.width != width || self.height != height {
+            self.pool = None;
+            self.rendered_generation = u64::MAX;
+        }
+        self.width = width;
+        self.height = height;
         if self.pool.is_none() {
             match SlotPool::new(4 * 1024 * 1024, &self.shm) {
                 Ok(pool) => self.pool = Some(pool),
@@ -445,6 +485,21 @@ impl LayerShellHandler for LayerState {
             self.draw(qh);
         }
     }
+}
+
+fn scaled_dimensions(width: u32, height: u32, scale: u32) -> Result<(u32, u32), String> {
+    if scale == 0 {
+        return Err(String::from("invalid Wayland buffer scale: 0"));
+    }
+    let width = width.max(1);
+    let height = height.max(1);
+    let width = width
+        .checked_mul(scale)
+        .ok_or_else(|| String::from("Wayland scaled width is too large"))?;
+    let height = height
+        .checked_mul(scale)
+        .ok_or_else(|| String::from("Wayland scaled height is too large"))?;
+    Ok((width, height))
 }
 
 #[cfg(test)]
@@ -465,6 +520,13 @@ mod tests {
         assert_eq!(state.lock().unwrap().error.as_deref(), Some("test failure"));
         clear_error(&state);
         assert_eq!(state.lock().unwrap().error, None);
+    }
+
+    #[test]
+    fn integer_scale_uses_physical_buffer_dimensions() {
+        assert_eq!(scaled_dimensions(1920, 1080, 1), Ok((1920, 1080)));
+        assert_eq!(scaled_dimensions(1920, 1080, 2), Ok((3840, 2160)));
+        assert!(scaled_dimensions(u32::MAX, 1, 2).is_err());
     }
 }
 

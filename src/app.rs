@@ -145,6 +145,13 @@ impl CrosshairApp {
 
         #[cfg(target_os = "linux")]
         if platform::uses_wayland() {
+            if display.scale_factor.fract() != 0.0 {
+                self.message = format!(
+                    "Wayland fractional display scale {:.2} is unsupported",
+                    display.scale_factor
+                );
+                return;
+            }
             if let Some(overlay) = &self.wayland_overlay {
                 overlay.update(state, self.state.display_index, display.name.clone());
                 if let Some(error) = overlay.error() {
