@@ -32,6 +32,7 @@ struct SharedState {
     crosshair: CrosshairState,
     display_index: usize,
     output_name: Option<String>,
+    generation: u64,
 }
 
 pub struct WaylandOverlay {
@@ -44,6 +45,7 @@ impl WaylandOverlay {
             crosshair: CrosshairState::default(),
             display_index: 0,
             output_name: None,
+            generation: 0,
         }));
         let worker_state = Arc::clone(&state);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -68,10 +70,19 @@ impl WaylandOverlay {
         display_index: usize,
         output_name: Option<String>,
     ) {
-        *self.state.lock().unwrap() = SharedState {
+        let mut state = self.state.lock().unwrap();
+        if state.crosshair == crosshair
+            && state.display_index == display_index
+            && state.output_name == output_name
+        {
+            return;
+        }
+        let generation = state.generation.wrapping_add(1);
+        *state = SharedState {
             crosshair,
             display_index,
             output_name,
+            generation,
         };
     }
 }
@@ -114,6 +125,7 @@ fn run_inner(
         height: 1,
         first_configure: true,
         display_index: 0,
+        rendered_generation: u64::MAX,
         state,
     };
 
@@ -144,6 +156,7 @@ struct LayerState {
     height: u32,
     first_configure: bool,
     display_index: usize,
+    rendered_generation: u64,
     state: Arc<Mutex<SharedState>>,
 }
 
@@ -215,8 +228,8 @@ impl LayerState {
             }
         };
         canvas.fill(0);
-        let crosshair = self.state.lock().unwrap().crosshair.clone();
-        draw_crosshair(canvas, width, height, &crosshair);
+        let shared = self.state.lock().unwrap().clone();
+        draw_crosshair(canvas, width, height, &shared.crosshair);
         layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
@@ -225,6 +238,15 @@ impl LayerState {
             eprintln!("Wayland overlay attach error: {error}");
             return;
         }
+        layer.commit();
+        self.rendered_generation = shared.generation;
+    }
+
+    fn schedule_frame(&self, qh: &QueueHandle<Self>) {
+        let Some(layer) = self.layer.as_ref() else {
+            return;
+        };
+        layer.wl_surface().frame(qh, layer.wl_surface().clone());
         layer.commit();
     }
 }
@@ -259,12 +281,15 @@ impl CompositorHandler for LayerState {
             .as_ref()
             .is_some_and(|layer| layer.wl_surface() == surface)
         {
-            let desired = self.state.lock().unwrap().display_index;
+            let shared = self.state.lock().unwrap().clone();
+            let desired = shared.display_index;
             if desired != self.display_index {
                 self.layer = None;
                 self.create_layer(qh);
-            } else {
+            } else if shared.generation != self.rendered_generation {
                 self.draw(qh);
+            } else {
+                self.schedule_frame(qh);
             }
         }
     }
