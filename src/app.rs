@@ -134,17 +134,11 @@ fn config_path() -> Option<PathBuf> {
     root.map(|root| root.join("crosshair").join("config"))
 }
 
-fn color_text(state: &RuntimeState) -> String {
-    let color = state.crosshair.color;
-    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
-}
-
 pub struct CrosshairApp {
     state: RuntimeState,
     displays: Vec<DisplayInfo>,
     command: String,
     message: String,
-    color_text: String,
     last_display_size: Option<DisplaySize>,
     #[cfg(target_os = "linux")]
     backend: platform::OverlayBackend,
@@ -155,13 +149,11 @@ impl CrosshairApp {
     pub fn new(_creation_context: &CreationContext<'_>, backend: platform::OverlayBackend) -> Self {
         let message = backend.startup_message();
         let config = AppConfig::load();
-        let color_text = color_text(&config.state);
         Self {
             state: config.state,
             displays: Vec::new(),
             command: String::new(),
             message,
-            color_text,
             last_display_size: None,
             backend,
         }
@@ -170,13 +162,11 @@ impl CrosshairApp {
     #[cfg(not(target_os = "linux"))]
     pub fn new(_creation_context: &CreationContext<'_>) -> Self {
         let config = AppConfig::load();
-        let color_text = color_text(&config.state);
         Self {
             state: config.state,
             displays: Vec::new(),
             command: String::new(),
             message: String::from("Waiting for display information"),
-            color_text,
             last_display_size: None,
         }
     }
@@ -382,10 +372,16 @@ impl CrosshairApp {
 
         ui.horizontal(|ui| {
             ui.label("Color");
-            if ui.text_edit_singleline(&mut self.color_text).lost_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-            {
-                self.run_command(format!("cl_crosshaircolor {}", self.color_text.trim()));
+            let mut color = [
+                self.state.crosshair.color.red,
+                self.state.crosshair.color.green,
+                self.state.crosshair.color.blue,
+            ];
+            if ui.color_edit_button_srgb(&mut color).changed() {
+                self.run_command(format!(
+                    "cl_crosshaircolor #{:02x}{:02x}{:02x}",
+                    color[0], color[1], color[2]
+                ));
             }
         });
         ui.horizontal(|ui| {
@@ -397,7 +393,6 @@ impl CrosshairApp {
             }
             if ui.button("Reset").clicked() {
                 self.run_command(String::from("crosshair_reset"));
-                self.color_text = String::from("#ff00ff");
             }
         });
     }
