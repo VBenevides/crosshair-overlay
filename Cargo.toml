@@ -1,0 +1,13 @@
+[package]
+name = "crosshair"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[lib]
+name = "crosshair"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crosshair"
+path = "src/main.rs"
