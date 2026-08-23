@@ -434,4 +434,14 @@ mod tests {
         );
         assert_eq!(state.display_index, 1);
     }
+
+    #[test]
+    fn status_reports_runtime_state() {
+        let mut state = RuntimeState::default();
+        state.apply("crosshair_offset -30 0", display()).unwrap();
+        let status = state.status(display());
+        assert!(status.contains("display=0"));
+        assert!(status.contains("position=Some((930, 540))"));
+        assert!(status.contains("color=#ffff00"));
+    }
 }

@@ -80,7 +80,9 @@ impl CrosshairApp {
             return;
         };
         match self.state.apply(&command, display) {
-            Ok(message) => self.message = format!("{message}: {command}"),
+            Ok(message) => {
+                self.message = format!("{message}: {command} | {}", self.state.status(display));
+            }
             Err(error) => self.message = error.to_string(),
         }
     }
