@@ -2,6 +2,7 @@ mod app;
 mod platform;
 
 fn main() -> eframe::Result {
+    #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([420.0, 620.0])
