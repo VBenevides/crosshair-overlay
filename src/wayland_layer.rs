@@ -24,7 +24,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 
 #[derive(Clone)]
@@ -137,7 +140,7 @@ fn run_inner(
         compositor,
         layer_shell,
         shm,
-        pool: None,
+        buffers: None,
         layer: None,
         width: 1,
         height: 1,
@@ -173,7 +176,7 @@ struct LayerState {
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
-    pool: Option<SlotPool>,
+    buffers: Option<BufferSet>,
     layer: Option<LayerSurface>,
     width: u32,
     height: u32,
@@ -185,6 +188,61 @@ struct LayerState {
     unsupported_transform: bool,
     initialized: bool,
     state: Arc<Mutex<SharedState>>,
+}
+
+struct BufferSet {
+    width: u32,
+    height: u32,
+    pool: SlotPool,
+    buffers: Vec<Buffer>,
+    front: Option<usize>,
+}
+
+impl BufferSet {
+    fn new(width: u32, height: u32, shm: &Shm) -> Result<Self, String> {
+        let stride = width
+            .checked_mul(4)
+            .and_then(|stride| i32::try_from(stride).ok())
+            .ok_or_else(|| String::from("Wayland buffer stride is too large"))?;
+        let bytes = (height as usize)
+            .checked_mul(stride as usize)
+            .ok_or_else(|| String::from("Wayland buffer size is too large"))?;
+        let pool_size = bytes
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(128))
+            .ok_or_else(|| String::from("Wayland buffer pool size is too large"))?;
+        let mut pool = SlotPool::new(pool_size, shm)
+            .map_err(|error| format!("shared-memory pool creation failed: {error}"))?;
+        let mut buffers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let slot = pool
+                .new_slot(bytes)
+                .map_err(|error| format!("shared-memory slot creation failed: {error}"))?;
+            let buffer = pool
+                .create_buffer_in(
+                    &slot,
+                    width as i32,
+                    height as i32,
+                    stride,
+                    wl_shm::Format::Argb8888,
+                )
+                .map_err(|error| format!("buffer creation failed: {error}"))?;
+            buffers.push(buffer);
+        }
+        Ok(Self {
+            width,
+            height,
+            pool,
+            buffers,
+            front: None,
+        })
+    }
+
+    fn next_index(&self) -> Option<usize> {
+        (0..self.buffers.len()).find(|&index| {
+            Some(index) != self.front && !self.buffers[index].slot().has_active_buffers()
+        })
+    }
 }
 
 impl LayerState {
@@ -234,6 +292,7 @@ impl LayerState {
         layer.commit();
         self.layer = Some(layer);
         self.bound_output = Some(output);
+        self.buffers = None;
         self.first_configure = true;
         self.rendered_generation = u64::MAX;
         Ok(())
@@ -271,8 +330,8 @@ impl LayerState {
         let Some(layer) = self.layer.clone() else {
             return;
         };
-        let Some(pool) = self.pool.as_mut() else {
-            set_error(&self.state, "Wayland shared-memory pool is unavailable");
+        let Some(buffers) = self.buffers.as_ref() else {
+            set_error(&self.state, "Wayland shared-memory buffers are unavailable");
             return;
         };
         let (width, height) = match scaled_dimensions(self.width, self.height, self.scale_factor) {
@@ -282,32 +341,38 @@ impl LayerState {
                 return;
             }
         };
-        let stride = width as i32 * 4;
         let shared = self.state.lock().unwrap().clone();
-        let (buffer, generation) = {
-            let (buffer, canvas) = match pool.create_buffer(
-                width as i32,
-                height as i32,
-                stride,
-                wl_shm::Format::Argb8888,
-            ) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    eprintln!("Wayland overlay buffer error: {error}");
-                    set_error(&self.state, format!("buffer creation failed: {error}"));
-                    return;
-                }
-            };
-            canvas.fill(0);
-            draw_crosshair(canvas, width, height, &shared.crosshair);
-            (buffer, shared.generation)
-        };
-        if let Err(error) = buffer.attach_to(layer.wl_surface()) {
-            eprintln!("Wayland overlay attach error: {error}");
-            set_error(&self.state, format!("buffer attach failed: {error}"));
+        let Some(index) = buffers.next_index() else {
             self.schedule_frame(qh);
             return;
-        }
+        };
+        let result = {
+            let buffers = self.buffers.as_mut().expect("buffer set checked above");
+            let buffer = &buffers.buffers[index];
+            {
+                let Some(canvas) = buffer.canvas(&mut buffers.pool) else {
+                    return self.schedule_frame(qh);
+                };
+                canvas.fill(0);
+                draw_crosshair(canvas, width, height, &shared.crosshair);
+            }
+            match buffer.attach_to(layer.wl_surface()) {
+                Ok(()) => {
+                    buffers.front = Some(index);
+                    Ok(shared.generation)
+                }
+                Err(error) => Err(format!("buffer attach failed: {error}")),
+            }
+        };
+        let generation = match result {
+            Ok(generation) => generation,
+            Err(error) => {
+                eprintln!("Wayland overlay attach error: {error}");
+                set_error(&self.state, error);
+                self.schedule_frame(qh);
+                return;
+            }
+        };
         layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
@@ -345,7 +410,7 @@ impl CompositorHandler for LayerState {
         let factor = factor as u32;
         if self.scale_factor != factor {
             self.scale_factor = factor;
-            self.pool = None;
+            self.buffers = None;
             self.rendered_generation = u64::MAX;
         }
     }
@@ -360,7 +425,7 @@ impl CompositorHandler for LayerState {
         if self.unsupported_transform {
             set_error(&self.state, "unsupported Wayland output transform");
         } else {
-            self.pool = None;
+            self.buffers = None;
             self.rendered_generation = u64::MAX;
             clear_error(&self.state);
         }
@@ -463,20 +528,25 @@ impl LayerShellHandler for LayerState {
         let width = NonZeroU32::new(configure.new_size.0).map_or(1, NonZeroU32::get);
         let height = NonZeroU32::new(configure.new_size.1).map_or(1, NonZeroU32::get);
         if self.width != width || self.height != height {
-            self.pool = None;
+            self.buffers = None;
             self.rendered_generation = u64::MAX;
         }
         self.width = width;
         self.height = height;
-        if self.pool.is_none() {
-            match SlotPool::new(4 * 1024 * 1024, &self.shm) {
-                Ok(pool) => self.pool = Some(pool),
+        let dimensions = scaled_dimensions(self.width, self.height, self.scale_factor);
+        let needs_buffers = match (&self.buffers, dimensions.as_ref()) {
+            (Some(buffers), Ok(&(width, height))) => {
+                buffers.width != width || buffers.height != height
+            }
+            _ => true,
+        };
+        if needs_buffers {
+            match dimensions.and_then(|(width, height)| BufferSet::new(width, height, &self.shm)) {
+                Ok(buffers) => self.buffers = Some(buffers),
                 Err(error) => {
-                    eprintln!("Wayland overlay pool error: {error}");
-                    set_error(
-                        &self.state,
-                        format!("shared-memory pool creation failed: {error}"),
-                    );
+                    eprintln!("Wayland overlay buffer error: {error}");
+                    self.buffers = None;
+                    set_error(&self.state, error);
                 }
             }
         }
@@ -499,6 +569,11 @@ fn scaled_dimensions(width: u32, height: u32, scale: u32) -> Result<(u32, u32), 
     let height = height
         .checked_mul(scale)
         .ok_or_else(|| String::from("Wayland scaled height is too large"))?;
+    if width > (i32::MAX as u32 / 4) || height > i32::MAX as u32 {
+        return Err(String::from(
+            "Wayland scaled buffer dimensions are too large",
+        ));
+    }
     Ok((width, height))
 }
 
