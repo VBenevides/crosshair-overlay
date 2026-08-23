@@ -91,20 +91,22 @@ impl DisplaySize {
     }
 
     pub fn contains_offset(self, x: i32, y: i32) -> bool {
+        self.offset_position(x, y).is_some()
+    }
+
+    fn offset_position(self, x: i32, y: i32) -> Option<(i32, i32)> {
         let (center_x, center_y) = self.center();
-        let position_x = center_x + x;
-        let position_y = center_y + y;
-        position_x >= 0
+        let position_x = center_x.checked_add(x)?;
+        let position_y = center_y.checked_add(y)?;
+        (position_x >= 0
             && position_y >= 0
             && position_x < self.width as i32
-            && position_y < self.height as i32
+            && position_y < self.height as i32)
+            .then_some((position_x, position_y))
     }
 
     pub fn position(self, x: i32, y: i32) -> Option<(i32, i32)> {
-        self.contains_offset(x, y).then(|| {
-            let (center_x, center_y) = self.center();
-            (center_x + x, center_y + y)
-        })
+        self.offset_position(x, y)
     }
 
     pub fn offset_limits(self) -> OffsetLimits {
@@ -408,6 +410,26 @@ mod tests {
         let before = state.clone();
         assert!(state.apply("cl_crosshairsize -1", display()).is_err());
         assert!(state.apply("crosshair_offset -961 0", display()).is_err());
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn extreme_offsets_are_rejected_without_overflow() {
+        let display = display();
+        let mut state = RuntimeState::default();
+        let before = state.clone();
+        for value in [i32::MIN, i32::MAX] {
+            assert_eq!(display.position(value, 0), None);
+            assert_eq!(display.position(0, value), None);
+            assert_eq!(
+                state.apply(&format!("crosshair_offset {value} 0"), display),
+                Err(CommandError::OffsetOutsideDisplay)
+            );
+            assert_eq!(
+                state.apply(&format!("crosshair_offset 0 {value}"), display),
+                Err(CommandError::OffsetOutsideDisplay)
+            );
+        }
         assert_eq!(state, before);
     }
 
