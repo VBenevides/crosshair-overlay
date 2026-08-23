@@ -16,6 +16,7 @@ pub struct CrosshairApp {
     command: String,
     message: String,
     color_text: String,
+    last_display_size: Option<DisplaySize>,
 }
 
 impl CrosshairApp {
@@ -26,6 +27,7 @@ impl CrosshairApp {
             command: String::new(),
             message: String::from("Waiting for display information"),
             color_text: String::from("#ffff00"),
+            last_display_size: None,
         }
     }
 
@@ -53,12 +55,28 @@ impl CrosshairApp {
             .collect::<Vec<_>>();
 
         if displays.is_empty() {
+            self.displays.clear();
+            self.state.display_index = 0;
             self.message = String::from("No usable display found");
             return;
         }
+        let previous_index = self.state.display_index;
         self.displays = displays;
         if self.state.display_index >= self.displays.len() {
             self.state.display_index = 0;
+            self.message =
+                format!("Display {previous_index} is unavailable; switched to display 0");
+        }
+        let display_size = self.displays[self.state.display_index].size;
+        if self.last_display_size != Some(display_size) {
+            self.last_display_size = Some(display_size);
+            if !display_size
+                .contains_offset(self.state.crosshair.offset_x, self.state.crosshair.offset_y)
+            {
+                self.state.crosshair.offset_x = 0;
+                self.state.crosshair.offset_y = 0;
+                self.message = String::from("Display changed; offset reset to (0, 0)");
+            }
         }
     }
 
@@ -249,6 +267,7 @@ impl App for CrosshairApp {
                 }
             });
             ui.label(&self.message);
+            ui.small("For reliable composition, use windowed or borderless-windowed mode.");
             if let Some(display) = self.selected_size() {
                 ui.monospace(self.state.status(display));
                 if let Some(info) = self.selected_display() {
