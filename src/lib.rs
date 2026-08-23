@@ -354,7 +354,10 @@ impl fmt::Display for CommandError {
             Self::MissingArgument(name) => write!(formatter, "missing argument: {name}"),
             Self::WrongArgumentCount => write!(formatter, "wrong argument count"),
             Self::InvalidValue(name) => write!(formatter, "invalid value: {name}"),
-            Self::InvalidDisplay => write!(formatter, "display dimensions must be non-zero"),
+            Self::InvalidDisplay => write!(
+                formatter,
+                "display dimensions must be non-zero and no greater than i32::MAX"
+            ),
             Self::InvalidDisplaySelection => write!(formatter, "display selection is unavailable"),
             Self::OffsetOutsideDisplay => {
                 write!(formatter, "offset places the crosshair outside the display")
@@ -459,6 +462,19 @@ mod tests {
             Err(CommandError::InvalidDisplaySelection)
         );
         assert_eq!(state.display_index, 1);
+    }
+
+    #[test]
+    fn invalid_display_dimensions_explain_both_limits() {
+        assert_eq!(DisplaySize::new(0, 1080), Err(CommandError::InvalidDisplay));
+        assert_eq!(
+            DisplaySize::new(i32::MAX as u32 + 1, 1080),
+            Err(CommandError::InvalidDisplay)
+        );
+        assert_eq!(
+            CommandError::InvalidDisplay.to_string(),
+            "display dimensions must be non-zero and no greater than i32::MAX"
+        );
     }
 
     #[test]
