@@ -1,6 +1,8 @@
 use crosshair::{DisplaySize, OffsetLimits, RuntimeState};
 use eframe::{App, CreationContext, Frame, egui};
 
+use crate::platform;
+
 #[derive(Clone, Debug)]
 struct DisplayInfo {
     label: String,
@@ -81,6 +83,27 @@ impl CrosshairApp {
             Ok(message) => self.message = format!("{message}: {command}"),
             Err(error) => self.message = error.to_string(),
         }
+    }
+
+    fn show_overlay(&mut self, context: &egui::Context) {
+        let Some(display_size) = self.selected_display().map(|display| display.size) else {
+            return;
+        };
+        if let Err(message) = platform::availability() {
+            self.message = message.to_owned();
+            return;
+        }
+
+        let state = self.state.crosshair.clone();
+        context.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("crosshair-overlay"),
+            platform::overlay_viewport(self.state.display_index, state.visible),
+            move |ui, _class| {
+                if state.visible {
+                    draw_crosshair(ui, &state, display_size);
+                }
+            },
+        );
     }
 
     fn slider(
@@ -210,27 +233,81 @@ impl CrosshairApp {
 impl App for CrosshairApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         self.refresh_displays(frame);
-        self.show_crosshair_settings(ui);
-        self.show_position_settings(ui);
-        ui.separator();
-        ui.heading("Command");
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.command);
-            if ui.button("Run").clicked() {
-                let command = std::mem::take(&mut self.command);
-                self.run_command(command);
+        self.show_overlay(ui.ctx());
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.show_crosshair_settings(ui);
+            self.show_position_settings(ui);
+            ui.separator();
+            ui.heading("Command");
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.command);
+                if ui.button("Run").clicked() {
+                    let command = std::mem::take(&mut self.command);
+                    self.run_command(command);
+                }
+            });
+            ui.label(&self.message);
+            if let Some(display) = self.selected_size() {
+                ui.monospace(self.state.status(display));
+                if let Some(info) = self.selected_display() {
+                    ui.small(format!("Scale factor: {:.2}", info.scale_factor));
+                }
             }
         });
-        ui.label(&self.message);
-        if let Some(display) = self.selected_size() {
-            ui.monospace(self.state.status(display));
-            if let Some(info) = self.selected_display() {
-                ui.small(format!("Scale factor: {:.2}", info.scale_factor));
-            }
-        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.08, 0.08, 0.08, 1.0]
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+fn draw_crosshair(ui: &mut egui::Ui, state: &crosshair::CrosshairState, _display: DisplaySize) {
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let to_points = |pixels: f32| pixels / pixels_per_point;
+    let center = ui.max_rect().center()
+        + egui::vec2(
+            state.offset_x as f32 / pixels_per_point,
+            state.offset_y as f32 / pixels_per_point,
+        );
+    let color = egui::Color32::from_rgba_unmultiplied(
+        state.color.red,
+        state.color.green,
+        state.color.blue,
+        state.alpha,
+    );
+    let outline_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, state.alpha);
+    let stroke_width = to_points(state.thickness);
+    let outline_width = to_points(state.outline_thickness * 2.0);
+    let painter = ui.painter();
+    let gap = to_points(state.gap);
+    let size = to_points(state.size);
+
+    for direction in [
+        egui::vec2(1.0, 0.0),
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(0.0, 1.0),
+        egui::vec2(0.0, -1.0),
+    ] {
+        let start = center + direction * gap;
+        let end = center + direction * (gap + size);
+        if state.draw_outline {
+            painter.line_segment(
+                [start, end],
+                egui::Stroke::new(stroke_width + outline_width, outline_color),
+            );
+        }
+        painter.line_segment([start, end], egui::Stroke::new(stroke_width, color));
+    }
+
+    if state.dot {
+        let radius = to_points(state.thickness.max(1.0)) / 2.0;
+        if state.draw_outline {
+            painter.circle_filled(
+                center,
+                radius + to_points(state.outline_thickness),
+                outline_color,
+            );
+        }
+        painter.circle_filled(center, radius, color);
     }
 }
