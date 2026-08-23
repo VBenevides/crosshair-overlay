@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use crosshair::Color;
 use crosshair::CrosshairState;
 use smithay_client_toolkit::reexports::client::{
     Connection, QueueHandle,
@@ -581,6 +583,11 @@ fn scaled_dimensions(width: u32, height: u32, scale: u32) -> Result<(u32, u32), 
 mod tests {
     use super::*;
 
+    fn pixel(canvas: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        canvas[offset..offset + 4].try_into().unwrap()
+    }
+
     #[test]
     fn runtime_error_can_be_reported_and_cleared() {
         let state = Arc::new(Mutex::new(SharedState {
@@ -602,6 +609,59 @@ mod tests {
         assert_eq!(scaled_dimensions(1920, 1080, 1), Ok((1920, 1080)));
         assert_eq!(scaled_dimensions(1920, 1080, 2), Ok((3840, 2160)));
         assert!(scaled_dimensions(u32::MAX, 1, 2).is_err());
+    }
+
+    #[test]
+    fn renderer_draws_default_dot_only() {
+        let state = CrosshairState::default();
+        let mut canvas = vec![0; 11 * 11 * 4];
+        draw_crosshair(&mut canvas, 11, 11, &state);
+
+        assert_eq!(pixel(&canvas, 11, 5, 5), [255, 0, 255, 255]);
+        assert!(canvas.chunks_exact(4).filter(|pixel| pixel[3] != 0).count() > 1);
+    }
+
+    #[test]
+    fn renderer_keeps_hidden_buffer_transparent() {
+        let state = CrosshairState {
+            visible: false,
+            ..CrosshairState::default()
+        };
+        let mut canvas = vec![0; 11 * 11 * 4];
+        draw_crosshair(&mut canvas, 11, 11, &state);
+        assert!(canvas.iter().all(|channel| *channel == 0));
+    }
+
+    #[test]
+    fn renderer_preserves_argb_byte_order_and_alpha() {
+        let state = CrosshairState {
+            color: Color {
+                red: 255,
+                green: 0,
+                blue: 0,
+            },
+            alpha: 128,
+            thickness: 1.0,
+            ..CrosshairState::default()
+        };
+        let mut canvas = vec![0; 3 * 3 * 4];
+        draw_crosshair(&mut canvas, 3, 3, &state);
+        assert_eq!(pixel(&canvas, 3, 1, 1), [0, 0, 128, 128]);
+    }
+
+    #[test]
+    fn renderer_clips_outlined_arms_to_buffer() {
+        let state = CrosshairState {
+            size: 8.0,
+            thickness: 3.0,
+            draw_outline: true,
+            outline_thickness: 2.0,
+            offset_x: -2,
+            ..CrosshairState::default()
+        };
+        let mut canvas = vec![0; 5 * 5 * 4];
+        draw_crosshair(&mut canvas, 5, 5, &state);
+        assert!(canvas.chunks_exact(4).any(|pixel| pixel[3] != 0));
     }
 }
 
