@@ -522,10 +522,13 @@ impl App for CrosshairApp {
 fn preview_cell(ui: &mut egui::Ui, state: &crosshair::CrosshairState, background: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 72.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 2.0, background);
+    let mut preview_state = state.clone();
+    preview_state.offset_x = 0;
+    preview_state.offset_y = 0;
     let mut preview_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
     draw_crosshair(
         &mut preview_ui,
-        state,
+        &preview_state,
         DisplaySize {
             width: 1,
             height: 1,

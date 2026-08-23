@@ -302,7 +302,7 @@ impl LayerState {
             Some(&output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::RIGHT | Anchor::BOTTOM | Anchor::LEFT);
-        layer.set_exclusive_zone(0);
+        layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, 0);
         if let Ok(region) = Region::new(&self.compositor) {
