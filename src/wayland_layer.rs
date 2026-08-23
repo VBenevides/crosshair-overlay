@@ -272,6 +272,23 @@ impl LayerState {
             .ok_or_else(|| format!("selected Wayland display index is unavailable: {index}"))
     }
 
+    fn output_size(&self) -> Option<(u32, u32)> {
+        let output = self.bound_output.as_ref()?;
+        let info = self.output_state.info(output)?;
+        if let Some((width, height)) = info.logical_size {
+            return Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?));
+        }
+        let mode = info
+            .modes
+            .iter()
+            .find(|mode| mode.current)
+            .or_else(|| info.modes.iter().find(|mode| mode.preferred))?;
+        let scale = i64::from(info.scale_factor.max(1));
+        let width = (i64::from(mode.dimensions.0) + scale - 1) / scale;
+        let height = (i64::from(mode.dimensions.1) + scale - 1) / scale;
+        Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+    }
+
     fn create_layer(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
         let shared = self.state.lock().unwrap().clone();
         self.display_index = shared.display_index;
@@ -527,8 +544,10 @@ impl LayerShellHandler for LayerState {
         if self.layer.as_ref() != Some(layer) {
             return;
         }
-        let width = NonZeroU32::new(configure.new_size.0).map_or(1, NonZeroU32::get);
-        let height = NonZeroU32::new(configure.new_size.1).map_or(1, NonZeroU32::get);
+        let output_size = self.output_size();
+        let (output_width, output_height) = output_size.unwrap_or((1, 1));
+        let width = configured_dimension(configure.new_size.0, output_width);
+        let height = configured_dimension(configure.new_size.1, output_height);
         if self.width != width || self.height != height {
             self.buffers = None;
             self.rendered_generation = u64::MAX;
@@ -557,6 +576,10 @@ impl LayerShellHandler for LayerState {
             self.draw(qh);
         }
     }
+}
+
+fn configured_dimension(suggested: u32, output: u32) -> u32 {
+    NonZeroU32::new(suggested).map_or(output.max(1), NonZeroU32::get)
 }
 
 fn scaled_dimensions(width: u32, height: u32, scale: u32) -> Result<(u32, u32), String> {
@@ -609,6 +632,12 @@ mod tests {
         assert_eq!(scaled_dimensions(1920, 1080, 1), Ok((1920, 1080)));
         assert_eq!(scaled_dimensions(1920, 1080, 2), Ok((3840, 2160)));
         assert!(scaled_dimensions(u32::MAX, 1, 2).is_err());
+    }
+
+    #[test]
+    fn zero_configure_dimension_uses_output_size() {
+        assert_eq!(configured_dimension(0, 1920), 1920);
+        assert_eq!(configured_dimension(1080, 1920), 1080);
     }
 
     #[test]
