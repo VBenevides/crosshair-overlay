@@ -78,7 +78,7 @@ pub struct DisplaySize {
 
 impl DisplaySize {
     pub fn new(width: u32, height: u32) -> Result<Self, CommandError> {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err(CommandError::InvalidDisplay);
         }
         Ok(Self { width, height })
@@ -104,6 +104,24 @@ impl DisplaySize {
             (center_x + x, center_y + y)
         })
     }
+
+    pub fn offset_limits(self) -> OffsetLimits {
+        let (center_x, center_y) = self.center();
+        OffsetLimits {
+            min_x: -center_x,
+            max_x: self.width as i32 - 1 - center_x,
+            min_y: -center_y,
+            max_y: self.height as i32 - 1 - center_y,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffsetLimits {
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_y: i32,
+    pub max_y: i32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +173,18 @@ impl Default for RuntimeState {
 }
 
 impl RuntimeState {
+    pub fn select_display(
+        &mut self,
+        index: usize,
+        display_count: usize,
+    ) -> Result<(), CommandError> {
+        if index >= display_count {
+            return Err(CommandError::InvalidDisplaySelection);
+        }
+        self.display_index = index;
+        Ok(())
+    }
+
     pub fn apply(&mut self, line: &str, display: DisplaySize) -> Result<String, CommandError> {
         let command = Command::from_str(line)?;
         let mut next = self.clone();
@@ -308,6 +338,7 @@ pub enum CommandError {
     WrongArgumentCount,
     InvalidValue(&'static str),
     InvalidDisplay,
+    InvalidDisplaySelection,
     OffsetOutsideDisplay,
 }
 
@@ -320,6 +351,7 @@ impl fmt::Display for CommandError {
             Self::WrongArgumentCount => write!(formatter, "wrong argument count"),
             Self::InvalidValue(name) => write!(formatter, "invalid value: {name}"),
             Self::InvalidDisplay => write!(formatter, "display dimensions must be non-zero"),
+            Self::InvalidDisplaySelection => write!(formatter, "display selection is unavailable"),
             Self::OffsetOutsideDisplay => {
                 write!(formatter, "offset places the crosshair outside the display")
             }
@@ -380,5 +412,26 @@ mod tests {
         let display = DisplaySize::new(3, 5).unwrap();
         assert_eq!(display.center(), (1, 2));
         assert_eq!(display.position(0, 0), Some((1, 2)));
+        assert_eq!(
+            display.offset_limits(),
+            OffsetLimits {
+                min_x: -1,
+                max_x: 1,
+                min_y: -2,
+                max_y: 2
+            }
+        );
+    }
+
+    #[test]
+    fn display_selection_is_validated() {
+        let mut state = RuntimeState::default();
+        state.select_display(1, 2).unwrap();
+        assert_eq!(state.display_index, 1);
+        assert_eq!(
+            state.select_display(2, 2),
+            Err(CommandError::InvalidDisplaySelection)
+        );
+        assert_eq!(state.display_index, 1);
     }
 }
