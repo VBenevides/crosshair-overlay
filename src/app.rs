@@ -397,6 +397,30 @@ impl CrosshairApp {
         });
     }
 
+    fn show_preview(&self, ui: &mut egui::Ui) {
+        ui.heading("Preview");
+        let state = &self.state.crosshair;
+        egui::Grid::new("crosshair_preview_grid")
+            .num_columns(2)
+            .spacing(egui::vec2(6.0, 6.0))
+            .show(ui, |ui| {
+                for (index, background) in [
+                    egui::Color32::WHITE,
+                    egui::Color32::from_gray(192),
+                    egui::Color32::from_gray(64),
+                    egui::Color32::BLACK,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    preview_cell(ui, state, background);
+                    if index % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    }
+
     fn show_position_settings(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Position");
@@ -458,7 +482,10 @@ impl App for CrosshairApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         self.refresh_displays(frame);
         egui::CentralPanel::default().show(ui, |ui| {
-            self.show_crosshair_settings(ui);
+            ui.columns(2, |columns| {
+                self.show_crosshair_settings(&mut columns[0]);
+                self.show_preview(&mut columns[1]);
+            });
             self.show_position_settings(ui);
             ui.separator();
             ui.heading("Command");
@@ -490,6 +517,20 @@ impl App for CrosshairApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
+}
+
+fn preview_cell(ui: &mut egui::Ui, state: &crosshair::CrosshairState, background: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 72.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, background);
+    let mut preview_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    draw_crosshair(
+        &mut preview_ui,
+        state,
+        DisplaySize {
+            width: 1,
+            height: 1,
+        },
+    );
 }
 
 fn draw_crosshair(ui: &mut egui::Ui, state: &crosshair::CrosshairState, _display: DisplaySize) {
