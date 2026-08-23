@@ -1,5 +1,7 @@
 use std::{
+    io::{self, Read, Write},
     num::NonZeroU32,
+    os::{fd::AsRawFd, unix::net::UnixStream},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -43,6 +45,7 @@ struct SharedState {
 
 pub struct WaylandOverlay {
     state: Arc<Mutex<SharedState>>,
+    wake_write: Arc<Mutex<UnixStream>>,
 }
 
 impl WaylandOverlay {
@@ -54,18 +57,28 @@ impl WaylandOverlay {
             generation: 0,
             error: None,
         }));
+        let (wake_read, wake_write) = UnixStream::pair().map_err(|error| error.to_string())?;
+        wake_read
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        wake_write
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
         let worker_state = Arc::clone(&state);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
         thread::spawn(move || {
-            let result = run(worker_state, &ready_tx);
+            let result = run(worker_state, &ready_tx, wake_read);
             if let Err(error) = result {
                 eprintln!("Wayland layer overlay stopped: {error}");
             }
         });
 
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok(Self { state }),
+            Ok(Ok(())) => Ok(Self {
+                state,
+                wake_write: Arc::new(Mutex::new(wake_write)),
+            }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(String::from("timed out starting the Wayland layer overlay")),
         }
@@ -93,6 +106,10 @@ impl WaylandOverlay {
             generation,
             error,
         };
+        drop(state);
+        if let Ok(mut wake_write) = self.wake_write.lock() {
+            let _ = wake_write.write(&[1]);
+        }
     }
 
     pub fn error(&self) -> Option<String> {
@@ -111,9 +128,10 @@ fn clear_error(state: &Arc<Mutex<SharedState>>) {
 fn run(
     state: Arc<Mutex<SharedState>>,
     ready_tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
+    wake_read: UnixStream,
 ) -> Result<(), String> {
     let error_state = Arc::clone(&state);
-    let result = run_inner(state, ready_tx);
+    let result = run_inner(state, ready_tx, wake_read);
     if let Err(error) = &result {
         set_error(&error_state, error.clone());
         let _ = ready_tx.send(Err(error.clone()));
@@ -124,6 +142,7 @@ fn run(
 fn run_inner(
     state: Arc<Mutex<SharedState>>,
     ready_tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
+    mut wake_read: UnixStream,
 ) -> Result<(), String> {
     let connection = Connection::connect_to_env().map_err(|error| error.to_string())?;
     let (globals, mut event_queue) =
@@ -167,8 +186,91 @@ fn run_inner(
 
     loop {
         event_queue
-            .blocking_dispatch(&mut overlay)
+            .dispatch_pending(&mut overlay)
             .map_err(|error| error.to_string())?;
+        overlay.render_if_needed(&queue_handle);
+        event_queue.flush().map_err(|error| error.to_string())?;
+
+        let Some(read_guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        let (wayland_ready, wake_ready, wake_closed) = wait_for_events(
+            read_guard.connection_fd().as_raw_fd(),
+            wake_read.as_raw_fd(),
+        )?;
+        if wake_closed {
+            return Ok(());
+        }
+        if wayland_ready {
+            read_guard.read().map_err(|error| error.to_string())?;
+            event_queue
+                .dispatch_pending(&mut overlay)
+                .map_err(|error| error.to_string())?;
+            overlay.render_if_needed(&queue_handle);
+        } else {
+            drop(read_guard);
+        }
+        if wake_ready {
+            drain_wakeup(&mut wake_read);
+            overlay.render_if_needed(&queue_handle);
+        }
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x001;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, count: usize, timeout: i32) -> i32;
+}
+
+fn wait_for_events(wayland_fd: i32, wake_fd: i32) -> Result<(bool, bool, bool), String> {
+    let mut fds = [
+        PollFd {
+            fd: wayland_fd,
+            events: POLLIN | POLLERR,
+            revents: 0,
+        },
+        PollFd {
+            fd: wake_fd,
+            events: POLLIN | POLLERR,
+            revents: 0,
+        },
+    ];
+    loop {
+        let result = unsafe { poll(fds.as_mut_ptr(), fds.len(), -1) };
+        if result >= 0 {
+            let wayland_revents = fds[0].revents;
+            let wake_revents = fds[1].revents;
+            return Ok((
+                wayland_revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0,
+                wake_revents & (POLLIN | POLLERR) != 0,
+                wake_revents & (POLLHUP | POLLNVAL) != 0,
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
+    }
+}
+
+fn drain_wakeup(wake_read: &mut UnixStream) {
+    let mut buffer = [0; 64];
+    loop {
+        match wake_read.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
     }
 }
 
@@ -395,10 +497,22 @@ impl LayerState {
         layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
-        layer.wl_surface().frame(qh, layer.wl_surface().clone());
         clear_error(&self.state);
         layer.commit();
         self.rendered_generation = generation;
+    }
+
+    fn render_if_needed(&mut self, qh: &QueueHandle<Self>) {
+        if self.reconcile_layer(qh) {
+            return;
+        }
+        if self.first_configure {
+            return;
+        }
+        let generation = self.state.lock().unwrap().generation;
+        if generation != self.rendered_generation {
+            self.draw(qh);
+        }
     }
 
     fn schedule_frame(&self, qh: &QueueHandle<Self>) {
@@ -462,15 +576,7 @@ impl CompositorHandler for LayerState {
             .as_ref()
             .is_some_and(|layer| layer.wl_surface() == surface)
         {
-            if self.reconcile_layer(qh) {
-                return;
-            }
-            let shared = self.state.lock().unwrap().clone();
-            if shared.generation != self.rendered_generation {
-                self.draw(qh);
-            } else {
-                self.schedule_frame(qh);
-            }
+            self.render_if_needed(qh);
         }
     }
 
