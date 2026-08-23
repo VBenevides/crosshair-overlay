@@ -147,6 +147,9 @@ impl CrosshairApp {
         if platform::uses_wayland() {
             if let Some(overlay) = &self.wayland_overlay {
                 overlay.update(state, self.state.display_index, display.name.clone());
+                if let Some(error) = overlay.error() {
+                    self.message = format!("Wayland overlay: {error}");
+                }
             }
             return;
         }

@@ -33,6 +33,7 @@ struct SharedState {
     display_index: usize,
     output_name: Option<String>,
     generation: u64,
+    error: Option<String>,
 }
 
 pub struct WaylandOverlay {
@@ -46,6 +47,7 @@ impl WaylandOverlay {
             display_index: 0,
             output_name: None,
             generation: 0,
+            error: None,
         }));
         let worker_state = Arc::clone(&state);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -78,21 +80,37 @@ impl WaylandOverlay {
             return;
         }
         let generation = state.generation.wrapping_add(1);
+        let error = state.error.clone();
         *state = SharedState {
             crosshair,
             display_index,
             output_name,
             generation,
+            error,
         };
     }
+
+    pub fn error(&self) -> Option<String> {
+        self.state.lock().unwrap().error.clone()
+    }
+}
+
+fn set_error(state: &Arc<Mutex<SharedState>>, error: impl Into<String>) {
+    state.lock().unwrap().error = Some(error.into());
+}
+
+fn clear_error(state: &Arc<Mutex<SharedState>>) {
+    state.lock().unwrap().error = None;
 }
 
 fn run(
     state: Arc<Mutex<SharedState>>,
     ready_tx: &std::sync::mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
+    let error_state = Arc::clone(&state);
     let result = run_inner(state, ready_tx);
     if let Err(error) = &result {
+        set_error(&error_state, error.clone());
         let _ = ready_tx.send(Err(error.clone()));
     }
     result
@@ -210,36 +228,44 @@ impl LayerState {
             return;
         };
         let Some(pool) = self.pool.as_mut() else {
+            set_error(&self.state, "Wayland shared-memory pool is unavailable");
             return;
         };
         let width = self.width.max(1);
         let height = self.height.max(1);
         let stride = width as i32 * 4;
-        let (buffer, canvas) = match pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride,
-            wl_shm::Format::Argb8888,
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                eprintln!("Wayland overlay buffer error: {error}");
-                return;
-            }
-        };
-        canvas.fill(0);
         let shared = self.state.lock().unwrap().clone();
-        draw_crosshair(canvas, width, height, &shared.crosshair);
+        let (buffer, generation) = {
+            let (buffer, canvas) = match pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            ) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    eprintln!("Wayland overlay buffer error: {error}");
+                    set_error(&self.state, format!("buffer creation failed: {error}"));
+                    return;
+                }
+            };
+            canvas.fill(0);
+            draw_crosshair(canvas, width, height, &shared.crosshair);
+            (buffer, shared.generation)
+        };
+        if let Err(error) = buffer.attach_to(layer.wl_surface()) {
+            eprintln!("Wayland overlay attach error: {error}");
+            set_error(&self.state, format!("buffer attach failed: {error}"));
+            self.schedule_frame(qh);
+            return;
+        }
         layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
         layer.wl_surface().frame(qh, layer.wl_surface().clone());
-        if let Err(error) = buffer.attach_to(layer.wl_surface()) {
-            eprintln!("Wayland overlay attach error: {error}");
-            return;
-        }
+        clear_error(&self.state);
         layer.commit();
-        self.rendered_generation = shared.generation;
+        self.rendered_generation = generation;
     }
 
     fn schedule_frame(&self, qh: &QueueHandle<Self>) {
@@ -340,12 +366,42 @@ impl LayerShellHandler for LayerState {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(1, NonZeroU32::get);
         self.height = NonZeroU32::new(configure.new_size.1).map_or(1, NonZeroU32::get);
         if self.pool.is_none() {
-            self.pool = SlotPool::new(4 * 1024 * 1024, &self.shm).ok();
+            match SlotPool::new(4 * 1024 * 1024, &self.shm) {
+                Ok(pool) => self.pool = Some(pool),
+                Err(error) => {
+                    eprintln!("Wayland overlay pool error: {error}");
+                    set_error(
+                        &self.state,
+                        format!("shared-memory pool creation failed: {error}"),
+                    );
+                }
+            }
         }
         if self.first_configure {
             self.first_configure = false;
             self.draw(qh);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_error_can_be_reported_and_cleared() {
+        let state = Arc::new(Mutex::new(SharedState {
+            crosshair: CrosshairState::default(),
+            display_index: 0,
+            output_name: None,
+            generation: 0,
+            error: None,
+        }));
+
+        set_error(&state, "test failure");
+        assert_eq!(state.lock().unwrap().error.as_deref(), Some("test failure"));
+        clear_error(&state);
+        assert_eq!(state.lock().unwrap().error, None);
     }
 }
 
