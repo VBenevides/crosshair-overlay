@@ -21,26 +21,13 @@ pub struct CrosshairApp {
     color_text: String,
     last_display_size: Option<DisplaySize>,
     #[cfg(target_os = "linux")]
-    wayland_overlay: Option<platform::WaylandOverlay>,
+    backend: platform::OverlayBackend,
 }
 
 impl CrosshairApp {
-    pub fn new(_creation_context: &CreationContext<'_>) -> Self {
-        #[allow(unused_mut)]
-        let mut message = String::from("Waiting for display information");
-        #[cfg(target_os = "linux")]
-        let wayland_overlay = if platform::uses_wayland() {
-            match platform::WaylandOverlay::new() {
-                Ok(overlay) => Some(overlay),
-                Err(error) => {
-                    message = error;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
+    #[cfg(target_os = "linux")]
+    pub fn new(_creation_context: &CreationContext<'_>, backend: platform::OverlayBackend) -> Self {
+        let message = backend.startup_message();
         Self {
             state: RuntimeState::default(),
             displays: Vec::new(),
@@ -48,8 +35,19 @@ impl CrosshairApp {
             message,
             color_text: String::from("#ff00ff"),
             last_display_size: None,
-            #[cfg(target_os = "linux")]
-            wayland_overlay,
+            backend,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(_creation_context: &CreationContext<'_>) -> Self {
+        Self {
+            state: RuntimeState::default(),
+            displays: Vec::new(),
+            command: String::new(),
+            message: String::from("Waiting for display information"),
+            color_text: String::from("#ff00ff"),
+            last_display_size: None,
         }
     }
 
@@ -135,16 +133,12 @@ impl CrosshairApp {
             return;
         };
         let display_size = display.size;
-        if let Err(message) = platform::availability() {
-            self.message = message.to_owned();
-            return;
-        }
 
         let state = self.state.crosshair.clone();
         let overlay_id = egui::ViewportId::from_hash_of("crosshair-overlay");
 
         #[cfg(target_os = "linux")]
-        if platform::uses_wayland() {
+        if let platform::OverlayBackend::Wayland(overlay) = &self.backend {
             if display.scale_factor.fract() != 0.0 {
                 self.message = format!(
                     "Wayland fractional display scale {:.2} is unsupported",
@@ -152,11 +146,9 @@ impl CrosshairApp {
                 );
                 return;
             }
-            if let Some(overlay) = &self.wayland_overlay {
-                overlay.update(state, self.state.display_index, display.name.clone());
-                if let Some(error) = overlay.error() {
-                    self.message = format!("Wayland overlay: {error}");
-                }
+            overlay.update(state, self.state.display_index, display.name.clone());
+            if let Some(error) = overlay.error() {
+                self.message = format!("Wayland overlay: {error}");
             }
             return;
         }

@@ -17,3 +17,4 @@ eframe = { version = "0.36.1", default-features = false, features = ["accesskit"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit = { version = "0.20.0", default-features = false }
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "x11"] }
