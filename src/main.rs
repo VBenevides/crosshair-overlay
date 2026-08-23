@@ -2,6 +2,12 @@ mod app;
 mod platform;
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "linux")]
+    // The MVP targets X11/XWayland; select it when both desktop variables exist.
+    unsafe {
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11")
+    };
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([420.0, 620.0])
