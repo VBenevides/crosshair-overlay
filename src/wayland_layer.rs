@@ -144,13 +144,16 @@ fn run_inner(
         first_configure: true,
         display_index: 0,
         rendered_generation: u64::MAX,
+        bound_output: None,
+        initialized: false,
         state,
     };
 
     event_queue
         .roundtrip(&mut overlay)
         .map_err(|error| error.to_string())?;
-    overlay.create_layer(&queue_handle);
+    overlay.create_layer(&queue_handle)?;
+    overlay.initialized = true;
     ready_tx
         .send(Ok(()))
         .map_err(|_| String::from("Wayland overlay initialization was cancelled"))?;
@@ -175,6 +178,8 @@ struct LayerState {
     first_configure: bool,
     display_index: usize,
     rendered_generation: u64,
+    bound_output: Option<wl_output::WlOutput>,
+    initialized: bool,
     state: Arc<Mutex<SharedState>>,
 }
 
@@ -183,7 +188,7 @@ impl LayerState {
         &self,
         requested_name: Option<&str>,
         index: usize,
-    ) -> Option<wl_output::WlOutput> {
+    ) -> Result<wl_output::WlOutput, String> {
         let outputs = self.output_state.outputs().collect::<Vec<_>>();
         if let Some(name) = requested_name {
             if let Some(output) = outputs.iter().find(|output| {
@@ -193,23 +198,27 @@ impl LayerState {
                     .as_deref()
                     == Some(name)
             }) {
-                return Some(output.clone());
+                return Ok(output.clone());
             }
+            return Err(format!("selected Wayland display is unavailable: {name}"));
         }
-        outputs.into_iter().nth(index)
+        outputs
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| format!("selected Wayland display index is unavailable: {index}"))
     }
 
-    fn create_layer(&mut self, qh: &QueueHandle<Self>) {
+    fn create_layer(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
         let shared = self.state.lock().unwrap().clone();
         self.display_index = shared.display_index;
-        let output = self.selected_output(shared.output_name.as_deref(), shared.display_index);
+        let output = self.selected_output(shared.output_name.as_deref(), shared.display_index)?;
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
             Layer::Overlay,
             Some("crosshair-overlay"),
-            output.as_ref(),
+            Some(&output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::RIGHT | Anchor::BOTTOM | Anchor::LEFT);
         layer.set_exclusive_zone(0);
@@ -220,7 +229,35 @@ impl LayerState {
         }
         layer.commit();
         self.layer = Some(layer);
+        self.bound_output = Some(output);
         self.first_configure = true;
+        self.rendered_generation = u64::MAX;
+        Ok(())
+    }
+
+    fn reconcile_layer(&mut self, qh: &QueueHandle<Self>) -> bool {
+        let shared = self.state.lock().unwrap().clone();
+        let desired =
+            match self.selected_output(shared.output_name.as_deref(), shared.display_index) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.layer = None;
+                    self.bound_output = None;
+                    set_error(&self.state, error);
+                    return true;
+                }
+            };
+        if self.layer.is_some() && self.bound_output.as_ref() == Some(&desired) {
+            return false;
+        }
+
+        self.layer = None;
+        self.bound_output = None;
+        match self.create_layer(qh) {
+            Ok(()) => clear_error(&self.state),
+            Err(error) => set_error(&self.state, error),
+        }
+        true
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -307,12 +344,11 @@ impl CompositorHandler for LayerState {
             .as_ref()
             .is_some_and(|layer| layer.wl_surface() == surface)
         {
+            if self.reconcile_layer(qh) {
+                return;
+            }
             let shared = self.state.lock().unwrap().clone();
-            let desired = shared.display_index;
-            if desired != self.display_index {
-                self.layer = None;
-                self.create_layer(qh);
-            } else if shared.generation != self.rendered_generation {
+            if shared.generation != self.rendered_generation {
                 self.draw(qh);
             } else {
                 self.schedule_frame(qh);
@@ -342,14 +378,41 @@ impl OutputHandler for LayerState {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        if self.initialized {
+            self.reconcile_layer(qh);
+        }
+    }
+    fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        if self.initialized {
+            self.reconcile_layer(qh);
+        }
+    }
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if !self.initialized {
+            return;
+        }
+        let selected_by_name = self.state.lock().unwrap().output_name.is_some();
+        if !selected_by_name || self.bound_output.as_ref() == Some(&output) {
+            self.layer = None;
+            self.bound_output = None;
+            set_error(&self.state, "selected Wayland display is unavailable");
+        }
+    }
 }
 
 impl LayerShellHandler for LayerState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+    fn closed(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface) {
         self.layer = None;
+        self.bound_output = None;
+        if self.initialized {
+            self.reconcile_layer(qh);
+        }
     }
 
     fn configure(
