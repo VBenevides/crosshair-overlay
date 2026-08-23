@@ -1,3 +1,5 @@
+use std::{fs, path::PathBuf};
+
 use crosshair::{DisplaySize, OffsetLimits, RuntimeState};
 use eframe::{App, CreationContext, Frame, egui};
 
@@ -11,6 +13,130 @@ struct DisplayInfo {
     size: DisplaySize,
     position: (i32, i32),
     scale_factor: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AppConfig {
+    state: RuntimeState,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            state: RuntimeState::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    fn load() -> Self {
+        config_path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map_or_else(Self::default, |text| Self::from_text(&text))
+    }
+
+    fn from_text(text: &str) -> Self {
+        let mut config = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "size" => set_float(&mut config.state.crosshair.size, value),
+                "gap" => set_float(&mut config.state.crosshair.gap, value),
+                "thickness" => set_float(&mut config.state.crosshair.thickness, value),
+                "outline_thickness" => {
+                    set_float(&mut config.state.crosshair.outline_thickness, value)
+                }
+                "red" => set_u8(&mut config.state.crosshair.color.red, value),
+                "green" => set_u8(&mut config.state.crosshair.color.green, value),
+                "blue" => set_u8(&mut config.state.crosshair.color.blue, value),
+                "alpha" => set_u8(&mut config.state.crosshair.alpha, value),
+                "dot" => set_bool(&mut config.state.crosshair.dot, value),
+                "draw_outline" => set_bool(&mut config.state.crosshair.draw_outline, value),
+                "visible" => set_bool(&mut config.state.crosshair.visible, value),
+                "offset_x" => set_i32(&mut config.state.crosshair.offset_x, value),
+                "offset_y" => set_i32(&mut config.state.crosshair.offset_y, value),
+                "display_index" => {
+                    if let Ok(index) = value.parse() {
+                        config.state.display_index = index;
+                    }
+                }
+                _ => {}
+            }
+        }
+        config
+    }
+
+    fn text(&self) -> String {
+        let crosshair = &self.state.crosshair;
+        format!(
+            "size={}\ngap={}\nthickness={}\noutline_thickness={}\nred={}\ngreen={}\nblue={}\nalpha={}\ndot={}\ndraw_outline={}\nvisible={}\noffset_x={}\noffset_y={}\ndisplay_index={}\n",
+            crosshair.size,
+            crosshair.gap,
+            crosshair.thickness,
+            crosshair.outline_thickness,
+            crosshair.color.red,
+            crosshair.color.green,
+            crosshair.color.blue,
+            crosshair.alpha,
+            crosshair.dot as u8,
+            crosshair.draw_outline as u8,
+            crosshair.visible as u8,
+            crosshair.offset_x,
+            crosshair.offset_y,
+            self.state.display_index,
+        )
+    }
+}
+
+fn set_float(target: &mut f32, value: &str) {
+    if let Ok(value) = value.parse::<f32>()
+        && value.is_finite()
+        && value >= 0.0
+    {
+        *target = value;
+    }
+}
+
+fn set_u8(target: &mut u8, value: &str) {
+    if let Ok(value) = value.parse() {
+        *target = value;
+    }
+}
+
+fn set_i32(target: &mut i32, value: &str) {
+    if let Ok(value) = value.parse() {
+        *target = value;
+    }
+}
+
+fn set_bool(target: &mut bool, value: &str) {
+    match value {
+        "0" => *target = false,
+        "1" => *target = true,
+        _ => {}
+    }
+}
+
+fn config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("APPDATA").map(PathBuf::from);
+
+    #[cfg(target_os = "linux")]
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let root: Option<PathBuf> = None;
+
+    root.map(|root| root.join("crosshair").join("config"))
+}
+
+fn color_text(state: &RuntimeState) -> String {
+    let color = state.crosshair.color;
+    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
 }
 
 pub struct CrosshairApp {
@@ -28,12 +154,14 @@ impl CrosshairApp {
     #[cfg(target_os = "linux")]
     pub fn new(_creation_context: &CreationContext<'_>, backend: platform::OverlayBackend) -> Self {
         let message = backend.startup_message();
+        let config = AppConfig::load();
+        let color_text = color_text(&config.state);
         Self {
-            state: RuntimeState::default(),
+            state: config.state,
             displays: Vec::new(),
             command: String::new(),
             message,
-            color_text: String::from("#ff00ff"),
+            color_text,
             last_display_size: None,
             backend,
         }
@@ -41,12 +169,14 @@ impl CrosshairApp {
 
     #[cfg(not(target_os = "linux"))]
     pub fn new(_creation_context: &CreationContext<'_>) -> Self {
+        let config = AppConfig::load();
+        let color_text = color_text(&config.state);
         Self {
-            state: RuntimeState::default(),
+            state: config.state,
             displays: Vec::new(),
             command: String::new(),
             message: String::from("Waiting for display information"),
-            color_text: String::from("#ff00ff"),
+            color_text,
             last_display_size: None,
         }
     }
@@ -83,6 +213,7 @@ impl CrosshairApp {
             self.message = String::from("No usable display found");
             return;
         }
+        let state_before_refresh = self.state.clone();
         let previous_index = self.state.display_index;
         self.displays = displays;
         if self.state.display_index >= self.displays.len() {
@@ -100,6 +231,9 @@ impl CrosshairApp {
                 self.state.crosshair.offset_y = 0;
                 self.message = String::from("Display changed; offset reset to (0, 0)");
             }
+        }
+        if self.state != state_before_refresh {
+            self.save_config();
         }
     }
 
@@ -123,8 +257,33 @@ impl CrosshairApp {
         match self.state.apply(&command, display) {
             Ok(message) => {
                 self.message = format!("{message}: {command} | {}", self.state.status(display));
+                self.save_config();
             }
             Err(error) => self.message = error.to_string(),
+        }
+    }
+
+    fn save_config(&self) {
+        let Some(path) = config_path() else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let temporary = path.with_extension("tmp");
+        let text = AppConfig {
+            state: self.state.clone(),
+        }
+        .text();
+        let _ = fs::remove_file(&temporary);
+        if fs::write(&temporary, &text).is_ok() {
+            if fs::rename(&temporary, &path).is_err() {
+                let _ = fs::write(&path, text);
+                let _ = fs::remove_file(temporary);
+            }
         }
     }
 
@@ -260,6 +419,7 @@ impl CrosshairApp {
                             .changed()
                         {
                             self.message = format!("Selected {}", display.label);
+                            self.save_config();
                         }
                     }
                 });
@@ -328,6 +488,10 @@ impl App for CrosshairApp {
         self.show_overlay(ui.ctx());
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_config();
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
@@ -383,5 +547,37 @@ fn draw_crosshair(ui: &mut egui::Ui, state: &crosshair::CrosshairState, _display
             );
         }
         painter.circle_filled(center, radius, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crosshair::Color;
+
+    #[test]
+    fn config_round_trips_current_state() {
+        let mut state = RuntimeState::default();
+        state.display_index = 2;
+        state.crosshair.size = 8.0;
+        state.crosshair.offset_x = -30;
+        state.crosshair.color = Color {
+            red: 12,
+            green: 34,
+            blue: 56,
+        };
+        state.crosshair.visible = false;
+
+        let text = AppConfig {
+            state: state.clone(),
+        }
+        .text();
+        assert_eq!(AppConfig::from_text(&text).state, state);
+    }
+
+    #[test]
+    fn invalid_config_values_keep_defaults() {
+        let config = AppConfig::from_text("size=-1\nalpha=999\ndot=maybe\noffset_x=nope\n");
+        assert_eq!(config.state, RuntimeState::default());
     }
 }
