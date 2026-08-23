@@ -13,7 +13,7 @@ pub fn availability() -> Result<(), &'static str> {
 }
 
 pub fn overlay_viewport(display_index: usize, visible: bool) -> egui::ViewportBuilder {
-    let mut builder = egui::ViewportBuilder::default()
+    let builder = egui::ViewportBuilder::default()
         .with_title("Crosshair Overlay")
         .with_monitor(display_index)
         .with_visible(visible)
@@ -26,12 +26,19 @@ pub fn overlay_viewport(display_index: usize, visible: bool) -> egui::ViewportBu
         .with_taskbar(false)
         .with_clamp_size_to_monitor_size(false);
 
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .with_window_level(egui::WindowLevel::AlwaysOnTop)
+        .with_active(false)
+        .with_taskbar(false);
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder;
+
     #[cfg(target_os = "linux")]
-    {
-        builder = builder
-            .with_window_type(egui::X11WindowType::Utility)
-            .with_override_redirect(false);
-    }
+    let builder = builder
+        .with_window_type(egui::X11WindowType::Utility)
+        .with_override_redirect(false);
 
     builder
 }
