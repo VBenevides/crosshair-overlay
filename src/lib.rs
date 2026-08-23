@@ -8,6 +8,12 @@ pub struct Color {
 }
 
 impl Color {
+    pub const MAGENTA: Self = Self {
+        red: 255,
+        green: 0,
+        blue: 255,
+    };
+
     pub const YELLOW: Self = Self {
         red: 255,
         green: 255,
@@ -36,11 +42,7 @@ impl Color {
                 green: 255,
                 blue: 0,
             }),
-            "magenta" => Some(Self {
-                red: 255,
-                green: 0,
-                blue: 255,
-            }),
+            "magenta" => Some(Self::MAGENTA),
             "red" => Some(Self {
                 red: 255,
                 green: 0,
@@ -143,10 +145,10 @@ impl Default for CrosshairState {
     fn default() -> Self {
         Self {
             visible: true,
-            size: 5.0,
+            size: 0.0,
             gap: 2.0,
-            thickness: 1.0,
-            color: Color::YELLOW,
+            thickness: 5.0,
+            color: Color::MAGENTA,
             alpha: 255,
             dot: true,
             draw_outline: false,
@@ -370,11 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_centered_yellow_dot() {
+    fn defaults_are_centered_magenta_dot() {
         let state = RuntimeState::default();
         assert!(state.crosshair.visible);
-        assert_eq!(state.crosshair.color, Color::YELLOW);
+        assert_eq!(state.crosshair.color, Color::MAGENTA);
         assert!(state.crosshair.dot);
+        assert_eq!(state.crosshair.size, 0.0);
+        assert_eq!(state.crosshair.thickness, 5.0);
         assert_eq!(state.position(display()), Some((960, 540)));
     }
 
@@ -442,6 +446,6 @@ mod tests {
         let status = state.status(display());
         assert!(status.contains("display=0"));
         assert!(status.contains("position=Some((930, 540))"));
-        assert!(status.contains("color=#ffff00"));
+        assert!(status.contains("color=#ff00ff"));
     }
 }

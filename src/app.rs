@@ -6,7 +6,10 @@ use crate::platform;
 #[derive(Clone, Debug)]
 struct DisplayInfo {
     label: String,
+    #[cfg(target_os = "linux")]
+    name: Option<String>,
     size: DisplaySize,
+    position: (i32, i32),
     scale_factor: f64,
 }
 
@@ -17,17 +20,36 @@ pub struct CrosshairApp {
     message: String,
     color_text: String,
     last_display_size: Option<DisplaySize>,
+    #[cfg(target_os = "linux")]
+    wayland_overlay: Option<platform::WaylandOverlay>,
 }
 
 impl CrosshairApp {
     pub fn new(_creation_context: &CreationContext<'_>) -> Self {
+        #[allow(unused_mut)]
+        let mut message = String::from("Waiting for display information");
+        #[cfg(target_os = "linux")]
+        let wayland_overlay = if platform::uses_wayland() {
+            match platform::WaylandOverlay::new() {
+                Ok(overlay) => Some(overlay),
+                Err(error) => {
+                    message = error;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             state: RuntimeState::default(),
             displays: Vec::new(),
             command: String::new(),
-            message: String::from("Waiting for display information"),
-            color_text: String::from("#ffff00"),
+            message,
+            color_text: String::from("#ff00ff"),
             last_display_size: None,
+            #[cfg(target_os = "linux")]
+            wayland_overlay,
         }
     }
 
@@ -48,7 +70,10 @@ impl CrosshairApp {
                         width = size.width,
                         height = size.height
                     ),
+                    #[cfg(target_os = "linux")]
+                    name: monitor.name(),
                     size,
+                    position: (monitor.position().x, monitor.position().y),
                     scale_factor: monitor.scale_factor(),
                 })
             })
@@ -106,18 +131,40 @@ impl CrosshairApp {
     }
 
     fn show_overlay(&mut self, context: &egui::Context) {
-        let Some(display_size) = self.selected_display().map(|display| display.size) else {
+        let Some(display) = self.selected_display() else {
             return;
         };
+        let display_size = display.size;
         if let Err(message) = platform::availability() {
             self.message = message.to_owned();
             return;
         }
 
         let state = self.state.crosshair.clone();
+        let overlay_id = egui::ViewportId::from_hash_of("crosshair-overlay");
+
+        #[cfg(target_os = "linux")]
+        if platform::uses_wayland() {
+            if let Some(overlay) = &self.wayland_overlay {
+                overlay.update(state, self.state.display_index, display.name.clone());
+            }
+            return;
+        }
+
         context.show_viewport_deferred(
-            egui::ViewportId::from_hash_of("crosshair-overlay"),
-            platform::overlay_viewport(self.state.display_index, state.visible),
+            overlay_id,
+            platform::overlay_viewport(
+                self.state.display_index,
+                [
+                    display.size.width as f32 / display.scale_factor as f32,
+                    display.size.height as f32 / display.scale_factor as f32,
+                ],
+                [
+                    display.position.0 as f32 / display.scale_factor as f32,
+                    display.position.1 as f32 / display.scale_factor as f32,
+                ],
+                state.visible,
+            ),
             move |ui, _class| {
                 if state.visible {
                     draw_crosshair(ui, &state, display_size);
@@ -189,7 +236,7 @@ impl CrosshairApp {
             }
             if ui.button("Reset").clicked() {
                 self.run_command(String::from("crosshair_reset"));
-                self.color_text = String::from("#ffff00");
+                self.color_text = String::from("#ff00ff");
             }
         });
     }
@@ -253,7 +300,6 @@ impl CrosshairApp {
 impl App for CrosshairApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
         self.refresh_displays(frame);
-        self.show_overlay(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_crosshair_settings(ui);
             self.show_position_settings(ui);
@@ -267,7 +313,9 @@ impl App for CrosshairApp {
                 }
             });
             ui.label(&self.message);
-            ui.small("For reliable composition, use windowed or borderless-windowed mode.");
+            ui.small(
+                "Wayland uses wlr-layer-shell; X11/Windows may need borderless-windowed mode.",
+            );
             if let Some(display) = self.selected_size() {
                 ui.monospace(self.state.status(display));
                 if let Some(info) = self.selected_display() {
@@ -275,6 +323,7 @@ impl App for CrosshairApp {
                 }
             }
         });
+        self.show_overlay(ui.ctx());
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -303,21 +352,23 @@ fn draw_crosshair(ui: &mut egui::Ui, state: &crosshair::CrosshairState, _display
     let gap = to_points(state.gap);
     let size = to_points(state.size);
 
-    for direction in [
-        egui::vec2(1.0, 0.0),
-        egui::vec2(-1.0, 0.0),
-        egui::vec2(0.0, 1.0),
-        egui::vec2(0.0, -1.0),
-    ] {
-        let start = center + direction * gap;
-        let end = center + direction * (gap + size);
-        if state.draw_outline {
-            painter.line_segment(
-                [start, end],
-                egui::Stroke::new(stroke_width + outline_width, outline_color),
-            );
+    if state.size > 0.0 {
+        for direction in [
+            egui::vec2(1.0, 0.0),
+            egui::vec2(-1.0, 0.0),
+            egui::vec2(0.0, 1.0),
+            egui::vec2(0.0, -1.0),
+        ] {
+            let start = center + direction * gap;
+            let end = center + direction * (gap + size);
+            if state.draw_outline {
+                painter.line_segment(
+                    [start, end],
+                    egui::Stroke::new(stroke_width + outline_width, outline_color),
+                );
+            }
+            painter.line_segment([start, end], egui::Stroke::new(stroke_width, color));
         }
-        painter.line_segment([start, end], egui::Stroke::new(stroke_width, color));
     }
 
     if state.dot {
