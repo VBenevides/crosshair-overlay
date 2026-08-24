@@ -70,6 +70,33 @@ impl Color {
             blue: u8::from_str_radix(&hex[4..6], 16).unwrap(),
         })
     }
+
+    fn from_index(index: u8) -> Option<Self> {
+        Some(match index {
+            0 => Self {
+                red: 255,
+                green: 0,
+                blue: 0,
+            },
+            1 => Self {
+                red: 0,
+                green: 255,
+                blue: 0,
+            },
+            2 => Self::YELLOW,
+            3 => Self {
+                red: 0,
+                green: 0,
+                blue: 255,
+            },
+            4 => Self {
+                red: 0,
+                green: 255,
+                blue: 255,
+            },
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,28 +217,49 @@ impl RuntimeState {
     }
 
     pub fn apply(&mut self, line: &str, display: DisplaySize) -> Result<String, CommandError> {
-        let command = Command::from_str(line)?;
         let mut next = self.clone();
-        match command {
-            Command::SetSize(value) => next.crosshair.size = value,
-            Command::SetGap(value) => next.crosshair.gap = value,
-            Command::SetThickness(value) => next.crosshair.thickness = value,
-            Command::SetColor(value) => next.crosshair.color = value,
-            Command::SetAlpha(value) => next.crosshair.alpha = value,
-            Command::SetDot(value) => next.crosshair.dot = value,
-            Command::SetOutline(value) => next.crosshair.draw_outline = value,
-            Command::SetOutlineThickness(value) => next.crosshair.outline_thickness = value,
-            Command::SetOffset(x, y) => {
-                if !display.contains_offset(x, y) {
-                    return Err(CommandError::OffsetOutsideDisplay);
+        let mut found_command = false;
+        for line in line
+            .split(';')
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            found_command = true;
+            match Command::from_str(line)? {
+                Command::SetSize(value) => next.crosshair.size = value,
+                Command::SetGap(value) => next.crosshair.gap = value,
+                Command::SetThickness(value) => next.crosshair.thickness = value,
+                Command::SetColor(value) => next.crosshair.color = value,
+                Command::SetColorIndex(value) => {
+                    if let Some(color) = Color::from_index(value) {
+                        next.crosshair.color = color;
+                    }
                 }
-                next.crosshair.offset_x = x;
-                next.crosshair.offset_y = y;
+                Command::SetColorChannel(channel, value) => match channel {
+                    ColorChannel::Red => next.crosshair.color.red = value,
+                    ColorChannel::Green => next.crosshair.color.green = value,
+                    ColorChannel::Blue => next.crosshair.color.blue = value,
+                },
+                Command::SetAlpha(value) => next.crosshair.alpha = value,
+                Command::SetDot(value) => next.crosshair.dot = value,
+                Command::SetOutline(value) => next.crosshair.draw_outline = value,
+                Command::SetOutlineThickness(value) => next.crosshair.outline_thickness = value,
+                Command::SetOffset(x, y) => {
+                    if !display.contains_offset(x, y) {
+                        return Err(CommandError::OffsetOutsideDisplay);
+                    }
+                    next.crosshair.offset_x = x;
+                    next.crosshair.offset_y = y;
+                }
+                Command::Show => next.crosshair.visible = true,
+                Command::Hide => next.crosshair.visible = false,
+                Command::Toggle => next.crosshair.visible = !next.crosshair.visible,
+                Command::Reset => next.crosshair = CrosshairState::default(),
+                Command::Noop => {}
             }
-            Command::Show => next.crosshair.visible = true,
-            Command::Hide => next.crosshair.visible = false,
-            Command::Toggle => next.crosshair.visible = !next.crosshair.visible,
-            Command::Reset => next.crosshair = CrosshairState::default(),
+        }
+        if !found_command {
+            return Err(CommandError::Empty);
         }
         *self = next;
         Ok(String::from("ok"))
@@ -248,6 +296,8 @@ enum Command {
     SetGap(f32),
     SetThickness(f32),
     SetColor(Color),
+    SetColorIndex(u8),
+    SetColorChannel(ColorChannel, u8),
     SetAlpha(u8),
     SetDot(bool),
     SetOutline(bool),
@@ -257,6 +307,14 @@ enum Command {
     Hide,
     Toggle,
     Reset,
+    Noop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ColorChannel {
+    Red,
+    Green,
+    Blue,
 }
 
 impl FromStr for Command {
@@ -267,16 +325,27 @@ impl FromStr for Command {
         let name = parts.next().ok_or(CommandError::Empty)?;
         let command = match name {
             "cl_crosshairsize" => Self::SetSize(non_negative_float(&mut parts, "size")?),
-            "cl_crosshairgap" => Self::SetGap(non_negative_float(&mut parts, "gap")?),
+            "cl_crosshairgap" => Self::SetGap(float(&mut parts, "gap")?),
             "cl_crosshairthickness" => {
                 Self::SetThickness(non_negative_float(&mut parts, "thickness")?)
             }
-            "cl_crosshaircolor" => Self::SetColor(Color::parse(argument(&mut parts, "color")?)?),
-            "cl_crosshairalpha" => Self::SetAlpha(
-                argument(&mut parts, "alpha")?
-                    .parse()
-                    .map_err(|_| CommandError::InvalidValue("alpha"))?,
-            ),
+            "cl_crosshaircolor" => {
+                let value = argument(&mut parts, "color")?;
+                match value.parse::<u8>() {
+                    Ok(index @ 0..=5) => Self::SetColorIndex(index),
+                    _ => Self::SetColor(Color::parse(value)?),
+                }
+            }
+            "cl_crosshaircolor_r" => {
+                Self::SetColorChannel(ColorChannel::Red, byte(&mut parts, "red")?)
+            }
+            "cl_crosshaircolor_g" => {
+                Self::SetColorChannel(ColorChannel::Green, byte(&mut parts, "green")?)
+            }
+            "cl_crosshaircolor_b" => {
+                Self::SetColorChannel(ColorChannel::Blue, byte(&mut parts, "blue")?)
+            }
+            "cl_crosshairalpha" => Self::SetAlpha(byte(&mut parts, "alpha")?),
             "cl_crosshairdot" => Self::SetDot(boolean(argument(&mut parts, "dot")?)?),
             "cl_crosshair_drawoutline" => {
                 Self::SetOutline(boolean(argument(&mut parts, "outline")?)?)
@@ -296,6 +365,27 @@ impl FromStr for Command {
             "crosshair_hide" => Self::Hide,
             "crosshair_toggle" => Self::Toggle,
             "crosshair_reset" => Self::Reset,
+            "cl_crosshair_dynamic_splitdist"
+            | "cl_fixedcrosshairgap"
+            | "cl_crosshair_dynamic_splitalpha_innermod"
+            | "cl_crosshair_dynamic_splitalpha_outermod"
+            | "cl_crosshair_dynamic_maxdist_splitratio" => {
+                float(&mut parts, "value")?;
+                Self::Noop
+            }
+            "cl_crosshair_recoil"
+            | "cl_crosshairgap_useweaponvalue"
+            | "cl_crosshairusealpha"
+            | "cl_crosshair_t" => {
+                boolean(argument(&mut parts, "value")?)?;
+                Self::Noop
+            }
+            "cl_crosshairstyle" => {
+                argument(&mut parts, "style")?
+                    .parse::<u8>()
+                    .map_err(|_| CommandError::InvalidValue("style"))?;
+                Self::Noop
+            }
             _ => return Err(CommandError::UnknownCommand(name.to_owned())),
         };
         if parts.next().is_some() {
@@ -326,11 +416,35 @@ fn non_negative_float<'a>(
     }
 }
 
+fn float<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    name: &'static str,
+) -> Result<f32, CommandError> {
+    let value = argument(parts, name)?
+        .parse::<f32>()
+        .map_err(|_| CommandError::InvalidValue(name))?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(CommandError::InvalidValue(name))
+}
+
+fn byte<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    name: &'static str,
+) -> Result<u8, CommandError> {
+    argument(parts, name)?
+        .parse()
+        .map_err(|_| CommandError::InvalidValue(name))
+}
+
 fn boolean(value: &str) -> Result<bool, CommandError> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(CommandError::InvalidValue("boolean")),
+    if value == "0" || value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else if value == "1" || value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else {
+        Err(CommandError::InvalidValue("boolean"))
     }
 }
 
@@ -405,6 +519,29 @@ mod tests {
         );
         assert!(!state.crosshair.dot);
         assert_eq!(state.position(display()), Some((930, 540)));
+    }
+
+    #[test]
+    fn cs2_configs_are_accepted() {
+        let mut state = RuntimeState::default();
+        state
+            .apply(
+                "cl_crosshairgap -4.5;cl_crosshair_outlinethickness 1;cl_crosshaircolor_r 0;cl_crosshaircolor_g 255;cl_crosshaircolor_b 0;cl_crosshairalpha 255;cl_crosshair_dynamic_splitdist 3;cl_crosshair_recoil false;cl_fixedcrosshairgap 3;cl_crosshaircolor 1;cl_crosshair_drawoutline false;cl_crosshair_dynamic_splitalpha_innermod 0.1;cl_crosshair_dynamic_splitalpha_outermod 1;cl_crosshair_dynamic_maxdist_splitratio 1;cl_crosshairthickness 1;cl_crosshairdot false;cl_crosshairgap_useweaponvalue false;cl_crosshairusealpha false;cl_crosshair_t false;cl_crosshairstyle 4;cl_crosshairsize 1",
+                display(),
+            )
+            .unwrap();
+        assert_eq!(state.crosshair.gap, -4.5);
+        assert_eq!(
+            state.crosshair.color,
+            Color {
+                red: 0,
+                green: 255,
+                blue: 0
+            }
+        );
+        assert_eq!(state.crosshair.size, 1.0);
+        assert_eq!(state.crosshair.thickness, 1.0);
+        assert!(!state.crosshair.dot);
     }
 
     #[test]

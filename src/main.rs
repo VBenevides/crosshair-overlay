@@ -2,6 +2,8 @@ mod app;
 mod platform;
 
 fn main() -> eframe::Result {
+    let title = format!("Crosshair - v{}", include_str!("../VERSION").trim());
+
     #[cfg(target_os = "linux")]
     let backend = platform::select_backend()
         .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
@@ -25,7 +27,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Crosshair",
+        &title,
         options,
         Box::new(move |creation_context| {
             #[cfg(target_os = "linux")]

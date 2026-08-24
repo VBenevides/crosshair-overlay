@@ -9,6 +9,7 @@ A lightweight, transparent crosshair overlay for desktop displays. Configure the
 - Wayland `wlr-layer-shell` overlay when available on Linux
 - X11/XWayland fallback on Linux
 - Settings saved automatically
+- Named profiles with Ctrl+S and Ctrl+O
 
 ## Requirements
 
@@ -34,16 +35,19 @@ The command field accepts:
 
 ```text
 cl_crosshairsize <number>
-cl_crosshairgap <number>
+cl_crosshairgap <number> (including negative values)
 cl_crosshairthickness <number>
 cl_crosshaircolor <name|#rrggbb>
+cl_crosshaircolor_r|g|b <0-255>
 cl_crosshairalpha <0-255>
-cl_crosshairdot <0|1>
-cl_crosshair_drawoutline <0|1>
+cl_crosshairdot <0|1|true|false>
+cl_crosshair_drawoutline <0|1|true|false>
 cl_crosshair_outlinethickness <number>
 crosshair_offset <x> <y>
 crosshair_show | crosshair_hide | crosshair_toggle | crosshair_reset
 ```
+
+Commands may be separated by semicolons, so CS2 crosshair config strings can be pasted directly.
 
 Offsets are relative to the selected display center and must remain inside the display.
 
@@ -53,6 +57,10 @@ Settings are saved automatically at:
 
 - Linux: `$XDG_CONFIG_HOME/crosshair/config`, or `$HOME/.config/crosshair/config`
 - Windows: `%APPDATA%\crosshair\config`
+
+Profiles are saved in a `profiles` directory beside that file. Open the Profiles panel to
+select existing profiles, or enter a file path to import/export a profile. The last selected
+profile is restored when the application starts again.
 
 ## Security boundary
 

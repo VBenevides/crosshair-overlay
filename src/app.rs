@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crosshair::{DisplaySize, OffsetLimits, RuntimeState};
 use eframe::{App, CreationContext, Frame, egui};
@@ -29,10 +32,20 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    fn load() -> Self {
+    fn load() -> (Self, Option<String>) {
         config_path()
             .and_then(|path| fs::read_to_string(path).ok())
-            .map_or_else(Self::default, |text| Self::from_text(&text))
+            .map_or_else(
+                || (Self::default(), None),
+                |text| (Self::from_text(&text), Self::active_profile(&text)),
+            )
+    }
+
+    fn active_profile(text: &str) -> Option<String> {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key == "active_profile" && valid_profile_name(value)).then(|| value.to_owned())
+        })
     }
 
     fn from_text(text: &str) -> Self {
@@ -42,11 +55,11 @@ impl AppConfig {
                 continue;
             };
             match key {
-                "size" => set_float(&mut config.state.crosshair.size, value),
+                "size" => set_non_negative_float(&mut config.state.crosshair.size, value),
                 "gap" => set_float(&mut config.state.crosshair.gap, value),
-                "thickness" => set_float(&mut config.state.crosshair.thickness, value),
+                "thickness" => set_non_negative_float(&mut config.state.crosshair.thickness, value),
                 "outline_thickness" => {
-                    set_float(&mut config.state.crosshair.outline_thickness, value)
+                    set_non_negative_float(&mut config.state.crosshair.outline_thickness, value)
                 }
                 "red" => set_u8(&mut config.state.crosshair.color.red, value),
                 "green" => set_u8(&mut config.state.crosshair.color.green, value),
@@ -93,6 +106,14 @@ impl AppConfig {
 fn set_float(target: &mut f32, value: &str) {
     if let Ok(value) = value.parse::<f32>()
         && value.is_finite()
+    {
+        *target = value;
+    }
+}
+
+fn set_non_negative_float(target: &mut f32, value: &str) {
+    if let Ok(value) = value.parse::<f32>()
+        && value.is_finite()
         && value >= 0.0
     {
         *target = value;
@@ -134,10 +155,24 @@ fn config_path() -> Option<PathBuf> {
     root.map(|root| root.join("crosshair").join("config"))
 }
 
+fn profiles_dir() -> Option<PathBuf> {
+    config_path().map(|path| path.with_file_name("profiles"))
+}
+
+fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 pub struct CrosshairApp {
     state: RuntimeState,
     displays: Vec<DisplayInfo>,
     command: String,
+    profile_name: String,
+    profile_file: String,
+    profiles_open: bool,
     message: String,
     last_display_size: Option<DisplaySize>,
     #[cfg(target_os = "linux")]
@@ -148,11 +183,14 @@ impl CrosshairApp {
     #[cfg(target_os = "linux")]
     pub fn new(_creation_context: &CreationContext<'_>, backend: platform::OverlayBackend) -> Self {
         let message = backend.startup_message();
-        let config = AppConfig::load();
+        let (config, profile_name) = AppConfig::load();
         Self {
             state: config.state,
             displays: Vec::new(),
             command: String::new(),
+            profile_name: profile_name.unwrap_or_else(|| String::from("default")),
+            profile_file: String::new(),
+            profiles_open: false,
             message,
             last_display_size: None,
             backend,
@@ -161,11 +199,14 @@ impl CrosshairApp {
 
     #[cfg(not(target_os = "linux"))]
     pub fn new(_creation_context: &CreationContext<'_>) -> Self {
-        let config = AppConfig::load();
+        let (config, profile_name) = AppConfig::load();
         Self {
             state: config.state,
             displays: Vec::new(),
             command: String::new(),
+            profile_name: profile_name.unwrap_or_else(|| String::from("default")),
+            profile_file: String::new(),
+            profiles_open: false,
             message: String::from("Waiting for display information"),
             last_display_size: None,
         }
@@ -257,24 +298,220 @@ impl CrosshairApp {
         let Some(path) = config_path() else {
             return;
         };
-        let Some(parent) = path.parent() else {
+        let profile_name = self.profile_name.trim();
+        self.save_state(
+            &path,
+            valid_profile_name(profile_name).then_some(profile_name),
+        );
+    }
+
+    fn profile_path(&self) -> Option<PathBuf> {
+        Self::profile_path_for(&self.profile_name)
+    }
+
+    fn profile_path_for(name: &str) -> Option<PathBuf> {
+        let name = name.trim();
+        if !valid_profile_name(name) {
+            return None;
+        }
+        profiles_dir().map(|directory| directory.join(format!("{name}.config")))
+    }
+
+    fn profile_names() -> Vec<String> {
+        let Some(directory) = profiles_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        let mut names = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("config"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        names.sort_by_cached_key(|name| name.to_ascii_lowercase());
+        names
+    }
+
+    fn save_profile(&mut self) {
+        let Some(path) = self.profile_path() else {
+            self.message = String::from("Profile name must use letters, numbers, '-' or '_'");
             return;
         };
-        if fs::create_dir_all(parent).is_err() {
+        if self.save_state(&path, None) {
+            self.save_config();
+            self.message = format!("Saved profile: {}", self.profile_name.trim());
+        } else {
+            self.message = String::from("Could not save profile");
+        }
+    }
+
+    fn load_profile(&mut self) {
+        let Some(path) = self.profile_path() else {
+            self.message = String::from("Profile name must use letters, numbers, '-' or '_'");
+            return;
+        };
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                self.state = AppConfig::from_text(&text).state;
+                self.last_display_size = None;
+                self.save_config();
+                self.message = format!("Loaded profile: {}", self.profile_name.trim());
+            }
+            Err(error) => self.message = format!("Could not load profile: {error}"),
+        }
+    }
+
+    fn delete_profile(&mut self, name: &str) {
+        let Some(path) = Self::profile_path_for(name) else {
+            self.message = String::from("Invalid profile name");
+            return;
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if self.profile_name.trim() == name {
+                    self.profile_name = String::from("default");
+                }
+                self.save_config();
+                self.message = format!("Deleted profile: {name}");
+            }
+            Err(error) => self.message = format!("Could not delete profile: {error}"),
+        }
+    }
+
+    fn import_profile(&mut self) {
+        let path = PathBuf::from(self.profile_file.trim());
+        if path.as_os_str().is_empty() {
+            self.message = String::from("Enter a profile file path to import");
             return;
         }
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                self.state = AppConfig::from_text(&text).state;
+                self.last_display_size = None;
+                self.save_config();
+                self.message = format!("Imported profile: {}", path.display());
+            }
+            Err(error) => self.message = format!("Could not import profile: {error}"),
+        }
+    }
+
+    fn export_profile(&mut self) {
+        let path = PathBuf::from(self.profile_file.trim());
+        if path.as_os_str().is_empty() {
+            self.message = String::from("Enter a profile file path to export");
+            return;
+        }
+        if self.save_state(&path, None) {
+            self.message = format!("Exported profile: {}", path.display());
+        } else {
+            self.message = String::from("Could not export profile");
+        }
+    }
+
+    fn save_state(&self, path: &Path, active_profile: Option<&str>) -> bool {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
         let temporary = path.with_extension("tmp");
-        let text = AppConfig {
+        let mut text = AppConfig {
             state: self.state.clone(),
         }
         .text();
-        let _ = fs::remove_file(&temporary);
-        if fs::write(&temporary, &text).is_ok() {
-            if fs::rename(&temporary, &path).is_err() {
-                let _ = fs::write(&path, text);
-                let _ = fs::remove_file(temporary);
-            }
+        if let Some(profile) = active_profile {
+            text.push_str(&format!("active_profile={profile}\n"));
         }
+        let _ = fs::remove_file(&temporary);
+        if fs::write(&temporary, &text).is_err() {
+            return false;
+        }
+        if fs::rename(&temporary, path).is_ok() {
+            return true;
+        }
+        let saved = fs::write(path, text).is_ok();
+        let _ = fs::remove_file(temporary);
+        saved
+    }
+
+    fn show_top_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Profiles").clicked() {
+                    self.profiles_open = !self.profiles_open;
+                }
+                if ui.button("Save Profile  (Ctrl+S)").clicked() {
+                    self.save_profile();
+                }
+                if ui.button("Load Profile  (Ctrl+O)").clicked() {
+                    self.load_profile();
+                }
+            });
+            if self.profiles_open {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut self.profile_name);
+                });
+                ui.label("Saved profiles");
+                let profiles = Self::profile_names();
+                if profiles.is_empty() {
+                    ui.small("No saved profiles");
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .max_height(80.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let column_count = profiles.len().div_ceil(3);
+                                for (index, column) in profiles.chunks(3).enumerate() {
+                                    ui.vertical(|ui| {
+                                        for profile in column {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.profile_name.trim() == profile,
+                                                        profile,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.profile_name = profile.clone();
+                                                }
+                                                if ui.small_button("X").clicked() {
+                                                    self.delete_profile(profile);
+                                                }
+                                            });
+                                        }
+                                    });
+                                    if index + 1 < column_count {
+                                        ui.separator();
+                                    }
+                                }
+                            });
+                        });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.profile_file)
+                            .hint_text("path/to/profile.config"),
+                    );
+                    if ui.button("Import").clicked() {
+                        self.import_profile();
+                    }
+                    if ui.button("Export").clicked() {
+                        self.export_profile();
+                    }
+                });
+            }
+        });
     }
 
     fn show_overlay(&mut self, context: &egui::Context) {
@@ -342,7 +579,7 @@ impl CrosshairApp {
             self.run_command(format!("cl_crosshairsize {size}"));
         }
         let mut gap = self.state.crosshair.gap;
-        if Self::slider(ui, "Gap", &mut gap, 0.0..=64.0) {
+        if Self::slider(ui, "Gap", &mut gap, -64.0..=64.0) {
             self.run_command(format!("cl_crosshairgap {gap}"));
         }
         let mut thickness = self.state.crosshair.thickness;
@@ -480,7 +717,20 @@ impl CrosshairApp {
 
 impl App for CrosshairApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
+        let (save_profile, load_profile) = ui.ctx().input(|input| {
+            (
+                input.modifiers.ctrl && input.key_pressed(egui::Key::S),
+                input.modifiers.ctrl && input.key_pressed(egui::Key::O),
+            )
+        });
+        if save_profile {
+            self.save_profile();
+        }
+        if load_profile {
+            self.load_profile();
+        }
         self.refresh_displays(frame);
+        self.show_top_bar(ui);
         egui::CentralPanel::default().show(ui, |ui| {
             ui.columns(2, |columns| {
                 self.show_crosshair_settings(&mut columns[0]);
@@ -618,5 +868,17 @@ mod tests {
     fn invalid_config_values_keep_defaults() {
         let config = AppConfig::from_text("size=-1\nalpha=999\ndot=maybe\noffset_x=nope\n");
         assert_eq!(config.state, RuntimeState::default());
+    }
+
+    #[test]
+    fn active_profile_round_trips_only_valid_names() {
+        assert_eq!(
+            AppConfig::active_profile("active_profile=Competitive\n"),
+            Some(String::from("Competitive"))
+        );
+        assert_eq!(
+            AppConfig::active_profile("active_profile=../config\n"),
+            None
+        );
     }
 }
