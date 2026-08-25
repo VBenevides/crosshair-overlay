@@ -1,12 +1,17 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
 };
 
 use crosshair::{DisplaySize, OffsetLimits, RuntimeState};
 use eframe::{App, CreationContext, Frame, egui};
 
 use crate::platform;
+
+const MAX_MONITORED_PROCESSES: usize = 5;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 struct DisplayInfo {
@@ -21,12 +26,16 @@ struct DisplayInfo {
 #[derive(Clone, Debug, PartialEq)]
 struct AppConfig {
     state: RuntimeState,
+    conditional_visibility: bool,
+    monitored_processes: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             state: RuntimeState::default(),
+            conditional_visibility: false,
+            monitored_processes: Vec::new(),
         }
     }
 }
@@ -75,15 +84,32 @@ impl AppConfig {
                         config.state.display_index = index;
                     }
                 }
+                "conditional_visibility" => set_bool(&mut config.conditional_visibility, value),
+                "monitored_process"
+                    if config.monitored_processes.len() < MAX_MONITORED_PROCESSES =>
+                {
+                    let process = value.trim();
+                    if !process.is_empty()
+                        && !config
+                            .monitored_processes
+                            .iter()
+                            .any(|item| item == process)
+                    {
+                        config.monitored_processes.push(process.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
+        config
+            .monitored_processes
+            .sort_by_cached_key(|process| process.to_ascii_lowercase());
         config
     }
 
     fn text(&self) -> String {
         let crosshair = &self.state.crosshair;
-        format!(
+        let mut text = format!(
             "size={}\ngap={}\nthickness={}\noutline_thickness={}\nred={}\ngreen={}\nblue={}\nalpha={}\ndot={}\ndraw_outline={}\nvisible={}\noffset_x={}\noffset_y={}\ndisplay_index={}\n",
             crosshair.size,
             crosshair.gap,
@@ -99,7 +125,21 @@ impl AppConfig {
             crosshair.offset_x,
             crosshair.offset_y,
             self.state.display_index,
-        )
+        );
+        text.push_str(&format!(
+            "conditional_visibility={}\n",
+            self.conditional_visibility as u8
+        ));
+        for process in self
+            .monitored_processes
+            .iter()
+            .take(MAX_MONITORED_PROCESSES)
+        {
+            text.push_str("monitored_process=");
+            text.push_str(process);
+            text.push('\n');
+        }
+        text
     }
 }
 
@@ -140,6 +180,42 @@ fn set_bool(target: &mut bool, value: &str) {
     }
 }
 
+fn process_name(value: &str) -> &str {
+    value.rsplit(['/', '\\']).next().unwrap_or(value)
+}
+
+fn process_name_matches(running: &str, configured: &str) -> bool {
+    let running = process_name(running).to_lowercase();
+    let configured = process_name(configured).to_lowercase();
+    running.contains(&configured)
+}
+
+fn is_process_running(configured: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    let output = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output();
+
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new("ps").args(["-A", "-o", "comm="]).output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        #[cfg(target_os = "windows")]
+        let running = line.split(',').next().unwrap_or("").trim_matches('"');
+
+        #[cfg(not(target_os = "windows"))]
+        let running = line.trim();
+
+        process_name_matches(running, configured)
+    })
+}
+
 fn config_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let root = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -173,6 +249,11 @@ pub struct CrosshairApp {
     profile_name: String,
     profile_file: String,
     profiles_open: bool,
+    conditional_visibility: bool,
+    monitored_processes: Vec<String>,
+    new_process: String,
+    process_running: bool,
+    last_process_check: Option<Instant>,
     message: String,
     last_display_size: Option<DisplaySize>,
     #[cfg(target_os = "linux")]
@@ -191,6 +272,11 @@ impl CrosshairApp {
             profile_name: profile_name.unwrap_or_else(|| String::from("default")),
             profile_file: String::new(),
             profiles_open: false,
+            conditional_visibility: config.conditional_visibility,
+            monitored_processes: config.monitored_processes,
+            new_process: String::new(),
+            process_running: false,
+            last_process_check: None,
             message,
             last_display_size: None,
             backend,
@@ -207,6 +293,11 @@ impl CrosshairApp {
             profile_name: profile_name.unwrap_or_else(|| String::from("default")),
             profile_file: String::new(),
             profiles_open: false,
+            conditional_visibility: config.conditional_visibility,
+            monitored_processes: config.monitored_processes,
+            new_process: String::new(),
+            process_running: false,
+            last_process_check: None,
             message: String::from("Waiting for display information"),
             last_display_size: None,
         }
@@ -357,7 +448,11 @@ impl CrosshairApp {
         };
         match fs::read_to_string(path) {
             Ok(text) => {
-                self.state = AppConfig::from_text(&text).state;
+                let config = AppConfig::from_text(&text);
+                self.state = config.state;
+                self.conditional_visibility = config.conditional_visibility;
+                self.monitored_processes = config.monitored_processes;
+                self.last_process_check = None;
                 self.last_display_size = None;
                 self.save_config();
                 self.message = format!("Loaded profile: {}", self.profile_name.trim());
@@ -391,7 +486,11 @@ impl CrosshairApp {
         }
         match fs::read_to_string(&path) {
             Ok(text) => {
-                self.state = AppConfig::from_text(&text).state;
+                let config = AppConfig::from_text(&text);
+                self.state = config.state;
+                self.conditional_visibility = config.conditional_visibility;
+                self.monitored_processes = config.monitored_processes;
+                self.last_process_check = None;
                 self.last_display_size = None;
                 self.save_config();
                 self.message = format!("Imported profile: {}", path.display());
@@ -425,6 +524,8 @@ impl CrosshairApp {
         let temporary = path.with_extension("tmp");
         let mut text = AppConfig {
             state: self.state.clone(),
+            conditional_visibility: self.conditional_visibility,
+            monitored_processes: self.monitored_processes.clone(),
         }
         .text();
         if let Some(profile) = active_profile {
@@ -440,6 +541,34 @@ impl CrosshairApp {
         let saved = fs::write(path, text).is_ok();
         let _ = fs::remove_file(temporary);
         saved
+    }
+
+    fn reset_process_check(&mut self) {
+        self.last_process_check = None;
+    }
+
+    fn refresh_process_status(&mut self, context: &egui::Context) {
+        if !self.conditional_visibility {
+            self.process_running = false;
+            self.last_process_check = None;
+            return;
+        }
+        let now = Instant::now();
+        let should_check = self
+            .last_process_check
+            .is_none_or(|last| now.duration_since(last) >= PROCESS_POLL_INTERVAL);
+        if should_check {
+            self.process_running = self
+                .monitored_processes
+                .iter()
+                .any(|process| is_process_running(process));
+            self.last_process_check = Some(now);
+        }
+        context.request_repaint_after(PROCESS_POLL_INTERVAL);
+    }
+
+    fn overlay_visible(&self) -> bool {
+        self.state.crosshair.visible && (!self.conditional_visibility || self.process_running)
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -514,13 +643,87 @@ impl CrosshairApp {
         });
     }
 
+    fn show_conditional_visibility(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Conditional Visibility");
+        if ui
+            .checkbox(
+                &mut self.conditional_visibility,
+                "Show crosshair only if monitored process is running",
+            )
+            .changed()
+        {
+            self.reset_process_check();
+            self.save_config();
+        }
+
+        let can_add = self.monitored_processes.len() < MAX_MONITORED_PROCESSES;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(can_add, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_process)
+                        .hint_text("Process name or executable"),
+                );
+                if ui.button("New Process/Executable").clicked() {
+                    let process = self.new_process.trim();
+                    if !process.is_empty()
+                        && !self.monitored_processes.iter().any(|item| item == process)
+                    {
+                        self.monitored_processes.push(process.to_owned());
+                        self.monitored_processes
+                            .sort_by_cached_key(|item| item.to_ascii_lowercase());
+                        self.new_process.clear();
+                        self.reset_process_check();
+                        self.save_config();
+                    }
+                }
+            });
+        });
+
+        ui.label("Monitored Processes / Executables");
+        if self.monitored_processes.is_empty() {
+            ui.small("No monitored processes");
+            return;
+        }
+
+        let mut remove = None;
+        egui::ScrollArea::horizontal()
+            .max_height(120.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let column_count = self.monitored_processes.len().div_ceil(5);
+                    for (index, column) in self.monitored_processes.chunks(5).enumerate() {
+                        ui.vertical(|ui| {
+                            for process in column {
+                                ui.horizontal(|ui| {
+                                    ui.label(process);
+                                    if ui.small_button("X").clicked() {
+                                        remove = Some(process.clone());
+                                    }
+                                });
+                            }
+                        });
+                        if index + 1 < column_count {
+                            ui.separator();
+                        }
+                    }
+                });
+            });
+        if let Some(process) = remove {
+            self.monitored_processes.retain(|item| item != &process);
+            self.reset_process_check();
+            self.save_config();
+        }
+    }
+
     fn show_overlay(&mut self, context: &egui::Context) {
         let Some(display) = self.selected_display() else {
             return;
         };
         let display_size = display.size;
 
-        let state = self.state.crosshair.clone();
+        let mut state = self.state.crosshair.clone();
+        state.visible = self.overlay_visible();
         let overlay_id = egui::ViewportId::from_hash_of("crosshair-overlay");
 
         #[cfg(target_os = "linux")]
@@ -732,31 +935,35 @@ impl App for CrosshairApp {
         self.refresh_displays(frame);
         self.show_top_bar(ui);
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.columns(2, |columns| {
-                self.show_crosshair_settings(&mut columns[0]);
-                self.show_preview(&mut columns[1]);
-            });
-            self.show_position_settings(ui);
-            ui.separator();
-            ui.heading("Command");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.command);
-                if ui.button("Run").clicked() {
-                    let command = std::mem::take(&mut self.command);
-                    self.run_command(command);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.columns(2, |columns| {
+                    self.show_crosshair_settings(&mut columns[0]);
+                    self.show_preview(&mut columns[1]);
+                });
+                self.show_position_settings(ui);
+                ui.separator();
+                ui.heading("Command");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.command);
+                    if ui.button("Run").clicked() {
+                        let command = std::mem::take(&mut self.command);
+                        self.run_command(command);
+                    }
+                });
+                ui.label(&self.message);
+                ui.small(
+                    "Wayland uses wlr-layer-shell; X11/Windows may need borderless-windowed mode.",
+                );
+                if let Some(display) = self.selected_size() {
+                    ui.monospace(self.state.status(display));
+                    if let Some(info) = self.selected_display() {
+                        ui.small(format!("Scale factor: {:.2}", info.scale_factor));
+                    }
                 }
+                self.show_conditional_visibility(ui);
             });
-            ui.label(&self.message);
-            ui.small(
-                "Wayland uses wlr-layer-shell; X11/Windows may need borderless-windowed mode.",
-            );
-            if let Some(display) = self.selected_size() {
-                ui.monospace(self.state.status(display));
-                if let Some(info) = self.selected_display() {
-                    ui.small(format!("Scale factor: {:.2}", info.scale_factor));
-                }
-            }
         });
+        self.refresh_process_status(ui.ctx());
         self.show_overlay(ui.ctx());
     }
 
@@ -857,11 +1064,13 @@ mod tests {
         };
         state.crosshair.visible = false;
 
-        let text = AppConfig {
+        let config = AppConfig {
             state: state.clone(),
-        }
-        .text();
-        assert_eq!(AppConfig::from_text(&text).state, state);
+            conditional_visibility: true,
+            monitored_processes: vec![String::from("alpha"), String::from("z.exe")],
+        };
+        let text = config.text();
+        assert_eq!(AppConfig::from_text(&text), config);
     }
 
     #[test]
@@ -880,5 +1089,27 @@ mod tests {
             AppConfig::active_profile("active_profile=../config\n"),
             None
         );
+    }
+
+    #[test]
+    fn monitored_processes_are_sorted_and_limited() {
+        let config = AppConfig::from_text(
+            "conditional_visibility=1\nmonitored_process=Zulu\nmonitored_process=alpha\nmonitored_process=bravo\nmonitored_process=charlie\nmonitored_process=delta\nmonitored_process=extra\n",
+        );
+        assert!(config.conditional_visibility);
+        assert_eq!(
+            config.monitored_processes,
+            ["alpha", "bravo", "charlie", "delta", "Zulu"]
+        );
+    }
+
+    #[test]
+    fn configured_executable_paths_match_process_names() {
+        assert!(process_name_matches("crosshair", "/usr/bin/crosshair"));
+        assert!(!process_name_matches("other", "/usr/bin/crosshair"));
+        assert!(process_name_matches(
+            "Mistfall Hunter linux-amd64...",
+            "MISTFALL"
+        ));
     }
 }

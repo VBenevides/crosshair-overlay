@@ -8,6 +8,7 @@ A lightweight, transparent crosshair overlay for desktop displays. Configure the
 - Multi-display selection and pixel offsets
 - Wayland `wlr-layer-shell` overlay when available on Linux
 - X11/XWayland fallback on Linux
+- Conditional visibility based on up to five monitored processes or executables
 - Settings saved automatically
 - Named profiles with Ctrl+S and Ctrl+O
 
@@ -62,6 +63,12 @@ Profiles are saved in a `profiles` directory beside that file. Open the Profiles
 select existing profiles, or enter a file path to import/export a profile. The last selected
 profile is restored when the application starts again.
 
+Enable Conditional Visibility to show the crosshair only while at least one listed process or
+executable is running. The list is checked every five seconds.
+
 ## Security boundary
 
-Crosshair is a display-only overlay. It does not inspect or modify game processes or files, inject or intercept input, use a network control endpoint, or require administrator/root privileges. Game-specific anti-cheat systems may still prohibit or detect overlays.
+Crosshair is a display-only overlay. When conditional visibility is enabled, it reads process names
+to decide whether to draw; it does not modify game processes or files, inject or intercept input,
+use a network control endpoint, or require administrator/root privileges. Game-specific anti-cheat
+systems may still prohibit or detect overlays.
