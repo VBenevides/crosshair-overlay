@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod app;
 mod platform;
 
@@ -10,8 +12,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 620.0])
-            .with_min_inner_size([360.0, 480.0])
+            .with_inner_size([800.0, 760.0])
+            .with_min_inner_size([700.0, 600.0])
             .with_transparent(true),
         renderer: eframe::Renderer::Glow,
         #[cfg(target_os = "linux")]

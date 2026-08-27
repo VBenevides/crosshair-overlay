@@ -256,6 +256,8 @@ pub struct CrosshairApp {
     last_process_check: Option<Instant>,
     message: String,
     last_display_size: Option<DisplaySize>,
+    #[cfg(target_os = "windows")]
+    overlay: platform::WindowsOverlay,
     #[cfg(target_os = "linux")]
     backend: platform::OverlayBackend,
 }
@@ -300,6 +302,8 @@ impl CrosshairApp {
             last_process_check: None,
             message: String::from("Waiting for display information"),
             last_display_size: None,
+            #[cfg(target_os = "windows")]
+            overlay: platform::WindowsOverlay::new(),
         }
     }
 
@@ -383,6 +387,30 @@ impl CrosshairApp {
             }
             Err(error) => self.message = error.to_string(),
         }
+    }
+
+    fn current_crosshair_command(&self) -> String {
+        let crosshair = &self.state.crosshair;
+        format!(
+            "cl_crosshairsize {};cl_crosshairgap {};cl_crosshairthickness {};cl_crosshaircolor #{:02x}{:02x}{:02x};cl_crosshairalpha {};cl_crosshairdot {};cl_crosshair_drawoutline {};cl_crosshair_outlinethickness {};crosshair_offset {} {};{}",
+            crosshair.size,
+            crosshair.gap,
+            crosshair.thickness,
+            crosshair.color.red,
+            crosshair.color.green,
+            crosshair.color.blue,
+            crosshair.alpha,
+            crosshair.dot as u8,
+            crosshair.draw_outline as u8,
+            crosshair.outline_thickness,
+            crosshair.offset_x,
+            crosshair.offset_y,
+            if crosshair.visible {
+                "crosshair_show"
+            } else {
+                "crosshair_hide"
+            }
+        )
     }
 
     fn save_config(&self) {
@@ -716,52 +744,63 @@ impl CrosshairApp {
         }
     }
 
-    fn show_overlay(&mut self, context: &egui::Context) {
+    fn show_overlay(&mut self, _context: &egui::Context) {
         let Some(display) = self.selected_display() else {
+            #[cfg(target_os = "windows")]
+            self.overlay.hide();
             return;
         };
         let display_size = display.size;
 
         let mut state = self.state.crosshair.clone();
         state.visible = self.overlay_visible();
-        let overlay_id = egui::ViewportId::from_hash_of("crosshair-overlay");
 
-        #[cfg(target_os = "linux")]
-        if let platform::OverlayBackend::Wayland(overlay) = &self.backend {
-            if display.scale_factor.fract() != 0.0 {
-                self.message = format!(
-                    "Wayland fractional display scale {:.2} is unsupported",
-                    display.scale_factor
-                );
-                return;
-            }
-            overlay.update(state, self.state.display_index, display.name.clone());
-            if let Some(error) = overlay.error() {
-                self.message = format!("Wayland overlay: {error}");
-            }
+        #[cfg(target_os = "windows")]
+        {
+            self.overlay.update(display.position, display_size, &state);
             return;
         }
 
-        context.show_viewport_deferred(
-            overlay_id,
-            platform::overlay_viewport(
-                self.state.display_index,
-                [
-                    display.size.width as f32 / display.scale_factor as f32,
-                    display.size.height as f32 / display.scale_factor as f32,
-                ],
-                [
-                    display.position.0 as f32 / display.scale_factor as f32,
-                    display.position.1 as f32 / display.scale_factor as f32,
-                ],
-                state.visible,
-            ),
-            move |ui, _class| {
-                if state.visible {
-                    draw_crosshair(ui, &state, display_size);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let overlay_id = egui::ViewportId::from_hash_of("crosshair-overlay");
+
+            #[cfg(target_os = "linux")]
+            if let platform::OverlayBackend::Wayland(overlay) = &self.backend {
+                if display.scale_factor.fract() != 0.0 {
+                    self.message = format!(
+                        "Wayland fractional display scale {:.2} is unsupported",
+                        display.scale_factor
+                    );
+                    return;
                 }
-            },
-        );
+                overlay.update(state, self.state.display_index, display.name.clone());
+                if let Some(error) = overlay.error() {
+                    self.message = format!("Wayland overlay: {error}");
+                }
+                return;
+            }
+
+            _context.show_viewport_deferred(
+                overlay_id,
+                platform::overlay_viewport(
+                    self.state.display_index,
+                    [
+                        display.size.width as f32 / display.scale_factor as f32,
+                        display.size.height as f32 / display.scale_factor as f32,
+                    ],
+                    [
+                        display.position.0 as f32 / display.scale_factor as f32,
+                        display.position.1 as f32 / display.scale_factor as f32,
+                    ],
+                ),
+                move |ui, _class| {
+                    if state.visible {
+                        draw_crosshair(ui, &state, display_size);
+                    }
+                },
+            );
+        }
     }
 
     fn slider(
@@ -950,6 +989,10 @@ impl App for CrosshairApp {
                         self.run_command(command);
                     }
                 });
+                if ui.button("Copy current crosshair command").clicked() {
+                    ui.ctx().copy_text(self.current_crosshair_command());
+                    self.message = String::from("Copied current crosshair command");
+                }
                 ui.label(&self.message);
                 ui.small(
                     "Wayland uses wlr-layer-shell; X11/Windows may need borderless-windowed mode.",
